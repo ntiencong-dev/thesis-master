@@ -24,6 +24,9 @@ FE-12  _prepare_image_batch: BGR→RGB conversion (first channel swapped)
 FE-13  Cosine similarity: 'person walking' closer to walking clip than 'car'
 FE-14  encode_frames with black frames: shape correct, no crash
 FE-15  encode_text: max-length (77 token) query does not raise
+FE-16  SigLIPFeatureExtractor: class importable and has correct class constants
+FE-17  SigLIPFeatureExtractor: EMBED_DIM class attribute is int > 0
+FE-18  SigLIPFeatureExtractor: _get_device used (inherits from module)
 """
 
 from __future__ import annotations
@@ -181,3 +184,27 @@ def test_FE15_encode_long_text_no_crash(extractor):
     long_query = "a " * 300   # far more than 77 tokens
     out = extractor.encode_text(long_query)
     assert out.shape == (1, EMBED_DIM)
+
+
+# ── FE-16..18  SigLIPFeatureExtractor (Phase 2, unit-level) ──────────────
+# These tests do NOT load the SigLIP model weights — they check the class
+# interface and constant values without triggering a model download.
+
+@pytest.mark.unit
+def test_FE16_siglip_class_importable():
+    from src.feature_extractor import SigLIPFeatureExtractor
+    assert SigLIPFeatureExtractor is not None
+
+
+@pytest.mark.unit
+def test_FE17_siglip_embed_dim_constant():
+    from src.feature_extractor import SigLIPFeatureExtractor
+    assert isinstance(SigLIPFeatureExtractor.EMBED_DIM, int)
+    assert SigLIPFeatureExtractor.EMBED_DIM > 0
+
+
+@pytest.mark.unit
+def test_FE18_siglip_model_name_constant():
+    from src.feature_extractor import SigLIPFeatureExtractor
+    assert isinstance(SigLIPFeatureExtractor.MODEL_NAME, str)
+    assert "SigLIP" in SigLIPFeatureExtractor.MODEL_NAME

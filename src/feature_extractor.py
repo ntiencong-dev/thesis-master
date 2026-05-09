@@ -185,3 +185,127 @@ class CLIPFeatureExtractor:
         if self.device.type == "cuda":
             tensors = tensors.half()   # float16 to match model
         return tensors
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — mSigLIP Multilingual Feature Extractor
+# ---------------------------------------------------------------------------
+
+class SigLIPFeatureExtractor:
+    """
+    Multilingual CLIP variant using ``ViT-L-16-SigLIP-256`` / ``webli`` weights
+    (Google SigLIP trained on Web Images with Language pairs).
+
+    Benefits over standard CLIP for VI→EN use-case
+    ------------------------------------------------
+    * Natively supports 100+ languages (including Vietnamese) — no translation.
+    * SigLIP's sigmoid loss (vs softmax) improves retrieval recall at low
+      similarity scores.
+    * 256×256 input resolution (vs 224×224) — better fine-grained detail.
+
+    Hardware budget (GTX 1650 Ti, 4 GB)
+    ------------------------------------
+    * EMBED_DIM = 1024 (ViT-L SigLIP)
+    * VRAM ~1.6 GB FP16 — within budget.
+
+    Parameters
+    ----------
+    model_name : str
+        open_clip model identifier. Default ``"ViT-L-16-SigLIP-256"``.
+    pretrained : str
+        open_clip pretrained tag. Default ``"webli"``.
+    device : str | None
+        ``"cuda"``, ``"cpu"``, or None (auto-detect).
+    batch_size : int
+        Frames per GPU forward pass.
+    """
+
+    MODEL_NAME  = "ViT-L-16-SigLIP-256"
+    PRETRAINED  = "webli"
+    EMBED_DIM   = 1024
+
+    def __init__(
+        self,
+        model_name: str = MODEL_NAME,
+        pretrained: str = PRETRAINED,
+        device: Optional[str] = None,
+        batch_size: int = 16,
+    ) -> None:
+        if _BACKEND != "open_clip":
+            raise ImportError("SigLIPFeatureExtractor requires open_clip (pip install open-clip-torch)")
+
+        self.device = _get_device(device)
+        self.batch_size = batch_size
+        self.EMBED_DIM = self.__class__.EMBED_DIM  # instance copy for fallback override
+
+        try:
+            self._model, _, self._preprocess = open_clip.create_model_and_transforms(
+                model_name, pretrained=pretrained
+            )
+            self._tokenizer = open_clip.get_tokenizer(model_name)
+        except Exception as exc:
+            import warnings
+            warnings.warn(
+                f"[SigLIPFeatureExtractor] Failed to load {model_name!r} "
+                f"({pretrained!r}): {exc}. "
+                "Falling back to ViT-B-16 / openai (dim=512)."
+            )
+            model_name = "ViT-B-16"
+            pretrained = "openai"
+            self._model, _, self._preprocess = open_clip.create_model_and_transforms(
+                model_name, pretrained=pretrained
+            )
+            self._tokenizer = open_clip.get_tokenizer(model_name)
+            self.EMBED_DIM = 512
+
+        self._model.to(self.device).eval()
+        if self.device.type == "cuda":
+            self._model = self._model.half()
+
+    # ------------------------------------------------------------------
+    # Public API — identical interface to CLIPFeatureExtractor
+    # ------------------------------------------------------------------
+
+    def encode_frames(self, frames_bgr: List[np.ndarray]) -> np.ndarray:
+        """
+        Returns (N, EMBED_DIM) float32 L2-normalised frame embeddings.
+        """
+        if not frames_bgr:
+            return np.empty((0, self.EMBED_DIM), dtype=np.float32)
+
+        results: List[np.ndarray] = []
+        for i in range(0, len(frames_bgr), self.batch_size):
+            batch = frames_bgr[i : i + self.batch_size]
+            tensor = self._prepare_image_batch(batch)
+            with torch.no_grad():
+                feats = self._model.encode_image(tensor)
+            feats = F.normalize(feats.float(), dim=-1)
+            results.append(feats.cpu().numpy())
+        return np.vstack(results).astype(np.float32)
+
+    def encode_text(self, texts: Union[str, List[str]]) -> np.ndarray:
+        """
+        Returns (N, EMBED_DIM) float32 L2-normalised text embeddings.
+        SigLIP tokenizer handles non-ASCII characters (multilingual).
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        with torch.no_grad():
+            tokens = self._tokenizer(texts).to(self.device)
+            feats  = self._model.encode_text(tokens)
+        feats = F.normalize(feats.float(), dim=-1)
+        return feats.cpu().numpy().astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _prepare_image_batch(self, frames_bgr: List[np.ndarray]) -> torch.Tensor:
+        """BGR uint8 → preprocessed float tensor on device."""
+        pil_images = [Image.fromarray(f[:, :, ::-1]) for f in frames_bgr]
+        tensors = torch.stack([self._preprocess(img) for img in pil_images])
+        tensors = tensors.to(self.device)
+        if self.device.type == "cuda":
+            tensors = tensors.half()
+        return tensors

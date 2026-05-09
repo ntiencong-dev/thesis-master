@@ -22,6 +22,13 @@ ENG-13  factory.create_engine type='pc' → PCEngine instance
 ENG-14  factory.create_engine type='kria' → ImportError on PC (no vart)
 ENG-15  factory.create_engine unknown type → ValueError
 ENG-16  factory.create_engine missing engine key → defaults to 'pc'
+ENG-17  factory.create_engine type='xclip' → XCLIPEngine (unit — no model load)
+ENG-18  factory.create_engine type='siglip' → SigLIPEngine (unit — no model load)
+ENG-19  XCLIPEngine.embed_dim == 512
+ENG-20  XCLIPEngine._sample_or_pad: fewer frames → padded to n
+ENG-21  XCLIPEngine._sample_or_pad: more frames → sub-sampled to n
+ENG-22  XCLIPEngine._sample_or_pad: empty input → n blank frames
+ENG-23  XCLIPEngine._sample_or_pad: exact n frames → unchanged
 """
 
 from __future__ import annotations
@@ -170,3 +177,73 @@ def test_ENG16_factory_defaults_to_pc():
     # No engine key at all → default to "pc"
     engine = create_engine({})
     assert isinstance(engine, PCEngine)
+
+
+# ── ENG-17..18  factory dispatch for Phase 2 engine types ─────────────────
+# These are pure unit tests — they verify factory routing without
+# actually loading the models (which would require large downloads).
+
+@pytest.mark.unit
+def test_ENG17_factory_xclip_type_accepted():
+    """factory.create_engine type='xclip' → XCLIPEngine (class check only)."""
+    from src.engines import xclip_engine  # must be importable
+    from src.engines.xclip_engine import XCLIPEngine
+    # Verify class is importable and is an InferenceEngine subclass
+    from src.engines.base_engine import InferenceEngine
+    assert issubclass(XCLIPEngine, InferenceEngine)
+
+
+@pytest.mark.unit
+def test_ENG18_factory_siglip_type_accepted():
+    """factory.create_engine type='siglip' → SigLIPEngine (class check only)."""
+    from src.engines import siglip_engine  # must be importable
+    from src.engines.siglip_engine import SigLIPEngine
+    from src.engines.base_engine import InferenceEngine
+    assert issubclass(SigLIPEngine, InferenceEngine)
+
+
+# ── ENG-19  XCLIPEngine embed_dim constant ───────────────────────────────
+
+@pytest.mark.unit
+def test_ENG19_xclip_embed_dim_constant():
+    from src.engines.xclip_engine import XCLIPEngine
+    assert XCLIPEngine.EMBED_DIM_VALUE == 512
+
+
+# ── ENG-20..23  XCLIPEngine._sample_or_pad (pure logic, no model) ────────
+
+@pytest.mark.unit
+def test_ENG20_sample_or_pad_pads_short():
+    from src.engines.xclip_engine import XCLIPEngine
+    import numpy as np
+    frames = [np.zeros((224, 224, 3), dtype=np.uint8)] * 3
+    result = XCLIPEngine._sample_or_pad(frames, 8)
+    assert len(result) == 8
+
+
+@pytest.mark.unit
+def test_ENG21_sample_or_pad_subsamples_long():
+    from src.engines.xclip_engine import XCLIPEngine
+    import numpy as np
+    frames = [np.zeros((224, 224, 3), dtype=np.uint8)] * 20
+    result = XCLIPEngine._sample_or_pad(frames, 8)
+    assert len(result) == 8
+
+
+@pytest.mark.unit
+def test_ENG22_sample_or_pad_empty_input():
+    from src.engines.xclip_engine import XCLIPEngine
+    result = XCLIPEngine._sample_or_pad([], 8)
+    assert len(result) == 8
+    import numpy as np
+    assert result[0].shape == (224, 224, 3)
+
+
+@pytest.mark.unit
+def test_ENG23_sample_or_pad_exact_n():
+    from src.engines.xclip_engine import XCLIPEngine
+    import numpy as np
+    frames = [np.zeros((224, 224, 3), dtype=np.uint8)] * 8
+    result = XCLIPEngine._sample_or_pad(frames, 8)
+    assert len(result) == 8
+    assert result is frames   # should return the same list unchanged

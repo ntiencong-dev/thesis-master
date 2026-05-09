@@ -133,20 +133,51 @@ class NLVideoSearcher:
                         "adaptive_threshold":True,"translate_vi":True},
         })
 
-    def index_video(self, video_path: str) -> int:
+    def index_video(self, video_path: str, use_scene_detection: bool = False) -> int:
         print(f"[Searcher] Indexing: {video_path}")
-        stride = self._window_sec * (1.0 - self._overlap_ratio)
-        pipe   = VideoPipeline(video_path=video_path, window_sec=self._window_sec,
-                               stride_sec=stride, frames_per_window=self._frames_per_window,
-                               backend=self._video_backend)
         vid_id = os.path.splitext(os.path.basename(video_path))[0]
         count  = 0
-        for t0, t1, frames in pipe.iter_segments():
-            if not frames: continue
-            emb  = self._engine.encode_segment_frames(frames)
-            meta = SegmentMeta(video_id=vid_id, video_path=video_path, start_time=t0, end_time=t1)
-            self._index.add(emb.reshape(1, -1), [meta])
-            count += 1
+
+        if use_scene_detection:
+            from .scene_segmenter import SceneSegmenter
+            from .video_processor import VideoProcessor
+            segmenter = SceneSegmenter(
+                max_scene_sec=self._window_sec * 2,
+                fallback_window_sec=self._window_sec,
+                fallback_stride_sec=self._window_sec * (1.0 - self._overlap_ratio),
+                use_fallback_if_unavailable=True,
+            )
+            proc = VideoProcessor(
+                fps_mode=None,
+                window_sec=self._window_sec,
+                stride_sec=self._window_sec * (1.0 - self._overlap_ratio),
+                frames_per_window=self._frames_per_window,
+            )
+            for t0, t1 in segmenter.iter_segments(video_path):
+                import cv2
+                cap = cv2.VideoCapture(video_path)
+                fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+                frames = proc._read_n_frames(cap, t0, t1, fps)
+                cap.release()
+                if not frames:
+                    continue
+                emb  = self._engine.encode_segment_frames(frames)
+                meta = SegmentMeta(video_id=vid_id, video_path=video_path,
+                                   start_time=t0, end_time=t1)
+                self._index.add(emb.reshape(1, -1), [meta])
+                count += 1
+        else:
+            stride = self._window_sec * (1.0 - self._overlap_ratio)
+            pipe   = VideoPipeline(video_path=video_path, window_sec=self._window_sec,
+                                   stride_sec=stride, frames_per_window=self._frames_per_window,
+                                   backend=self._video_backend)
+            for t0, t1, frames in pipe.iter_segments():
+                if not frames: continue
+                emb  = self._engine.encode_segment_frames(frames)
+                meta = SegmentMeta(video_id=vid_id, video_path=video_path, start_time=t0, end_time=t1)
+                self._index.add(emb.reshape(1, -1), [meta])
+                count += 1
+
         print(f"[Searcher] +{count} segments | total={self._index.total_vectors()}")
         if self.index_dir: self._index.save(self.index_dir)
         return count

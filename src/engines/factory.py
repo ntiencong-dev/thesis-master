@@ -47,6 +47,14 @@ def create_engine(config: dict) -> InferenceEngine:
         from .kria_engine import KriaEngine
         return KriaEngine(engine_cfg)
 
+    if engine_type == "xclip":
+        from .xclip_engine import XCLIPEngine
+        return XCLIPEngine(engine_cfg)
+
+    if engine_type == "siglip":
+        from .siglip_engine import SigLIPEngine
+        return SigLIPEngine(engine_cfg)
+
     raise ValueError(
         f"Unknown engine type '{engine_type}'. "
         "Valid options: 'pc', 'kria'."

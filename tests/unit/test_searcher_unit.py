@@ -18,6 +18,8 @@ QN-09  Five CLIP templates produced from a cleaned query
 QN-10  Every template in _CLIP_TEMPLATES contains exactly one "{}" placeholder
 QN-11  "locate <X>" stripped
 QN-12  "can you find <X>" stripped
+QN-13  index_video accepts use_scene_detection keyword parameter (Phase 2)
+QN-14  NLVideoSearcher.from_params signature still works (regression)
 """
 
 from __future__ import annotations
@@ -118,3 +120,29 @@ def test_QN12_can_you_find_stripped():
     result = _normalize_query("can you find the cat on the roof")
     assert "can you" not in result.lower()
     assert "cat" in result
+
+
+# ── QN-13  index_video Phase 2 signature ─────────────────────────────────
+
+@pytest.mark.unit
+def test_QN13_index_video_accepts_use_scene_detection_param():
+    """index_video must accept use_scene_detection keyword without TypeError."""
+    import inspect
+    from src.searcher import NLVideoSearcher
+    sig = inspect.signature(NLVideoSearcher.index_video)
+    assert "use_scene_detection" in sig.parameters, \
+        "index_video must have 'use_scene_detection' parameter (Phase 2)"
+
+
+# ── QN-14  from_params regression ────────────────────────────────────────
+
+@pytest.mark.unit
+def test_QN14_from_params_still_works():
+    """from_params() must not raise TypeError with default arguments."""
+    import inspect
+    from src.searcher import NLVideoSearcher
+    sig = inspect.signature(NLVideoSearcher.from_params)
+    params = list(sig.parameters.keys())
+    # Required params must still be present
+    assert "index_dir" in params
+    assert "window_sec" in params

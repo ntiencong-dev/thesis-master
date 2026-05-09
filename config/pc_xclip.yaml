@@ -1,0 +1,23 @@
+backend: pc
+engine:
+  type: xclip
+  model_name: "microsoft/xclip-base-patch16"
+  device: null        # auto-detect (cuda if available)
+  batch_size: 8
+  frames_per_window: 8
+
+pipeline:
+  video_backend: opencv
+  window_sec: 5.0
+  overlap_ratio: 0.50
+
+index:
+  embed_dim: 512
+  index_dir: ./index_store_xclip
+
+search:
+  top_k: 5
+  score_threshold: 0.20
+  nms_iou_threshold: 0.30
+  adaptive_threshold: true
+  translate_vi: true

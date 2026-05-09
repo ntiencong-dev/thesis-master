@@ -30,6 +30,9 @@ SR-19  SearchResult.rank is sequential (1, 2, 3, ...)
 SR-20  from_config: config path not found → FileNotFoundError
 SR-21  search_debug returns expected dict keys; query_cleaned differs from query_original
 SR-22  search_debug query_cleaned matches _normalize_query() output
+SR-23  index_video with use_scene_detection=True returns positive count (Phase 2)
+SR-24  index_video scene detection: result count is positive integer
+SR-25  index_video scene detection: all indexed segments have valid timestamps
 """
 
 from __future__ import annotations
@@ -281,3 +284,43 @@ def test_SR22_search_debug_cleaned_matches_normalize(searcher_with_real_video):
     q = "show me the person running"
     dbg = searcher_with_real_video.search_debug(q, top_k=3)
     assert dbg["query_cleaned"] == _normalize_query(q)
+
+
+# ── SR-23..25  Phase 2: scene-detection indexing ─────────────────────────
+
+def test_SR23_scene_detection_index_video_positive(real_video_path):
+    """index_video with use_scene_detection=True must index at least one segment."""
+    import warnings; warnings.filterwarnings("ignore")
+    from src.searcher import NLVideoSearcher
+    s = NLVideoSearcher.from_params(
+        use_sliding_window=True,
+        window_sec=5.0,
+        overlap_ratio=0.5,
+        frames_per_window=3,
+    )
+    count = s.index_video(real_video_path, use_scene_detection=True)
+    assert count > 0, f"Expected > 0 segments, got {count}"
+
+
+def test_SR24_scene_detection_count_is_int(real_video_path):
+    """index_video with use_scene_detection=True returns an integer."""
+    import warnings; warnings.filterwarnings("ignore")
+    from src.searcher import NLVideoSearcher
+    s = NLVideoSearcher.from_params(frames_per_window=3)
+    count = s.index_video(real_video_path, use_scene_detection=True)
+    assert isinstance(count, int)
+
+
+def test_SR25_scene_detection_valid_timestamps(real_video_path):
+    """All scene-segmented segments must have 0 <= start_time < end_time."""
+    import warnings; warnings.filterwarnings("ignore")
+    from src.searcher import NLVideoSearcher
+    s = NLVideoSearcher.from_params(frames_per_window=3)
+    s.index_video(real_video_path, use_scene_detection=True)
+    results = s.search("scene", top_k=50, score_threshold=0.0)
+    for r in results:
+        assert r.start_time >= 0.0, f"start_time {r.start_time} < 0"
+        assert r.end_time > r.start_time, \
+            f"end_time {r.end_time} <= start_time {r.start_time}"
+        assert r.end_time <= VIDEO_DURATION + 1.0, \
+            f"end_time {r.end_time} > video duration {VIDEO_DURATION}"
