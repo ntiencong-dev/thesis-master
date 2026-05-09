@@ -1,0 +1,32 @@
+# ============================================================
+# NLVS — PC Prototype Configuration (GTX 1650 Ti, CUDA)
+# Switch to kria.yaml for AMD Kria KV260 deployment.
+# ============================================================
+
+backend: pc
+
+engine:
+  type: pc                  # 'pc' → PyTorch/CLIP  |  'kria' → VART/DPU
+  model_name: ViT-B-16
+  pretrained: openai
+  device: cuda              # auto-falls-back to 'cpu' if no CUDA
+  batch_size: 32
+  frames_per_window: 5      # multi-frame averaging: N frames per segment
+
+pipeline:
+  video_backend: opencv     # 'opencv' (default) | 'gstreamer'
+  window_sec: 5.0           # sliding-window duration
+  overlap_ratio: 0.50       # 50 % overlap → stride = 2.5 s
+
+index:
+  embed_dim: 512            # ViT-B/16 joint embedding dimension
+  index_dir: ./index_store
+
+search:
+  top_k: 5
+  score_threshold: 0.20     # drop results below this cosine similarity
+  nms_iou_threshold: 0.50   # temporal NMS: merge windows with IoU > 50 %
+
+api:
+  host: 0.0.0.0
+  port: 8000

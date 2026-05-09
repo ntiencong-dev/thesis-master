@@ -1,0 +1,37 @@
+# ============================================================
+# NLVS — Edge Deployment Configuration (AMD Kria KV260)
+# DPU B4096, Vitis AI 3.5, VVAS pipeline
+# ============================================================
+
+backend: kria
+
+engine:
+  type: kria                # 'kria' → VART + .xmodel on DPU
+  xmodel_path: /usr/share/vitis_ai_library/models/clip_vit_b16/clip_vision.xmodel
+  xmodel_text_path: /usr/share/vitis_ai_library/models/clip_vit_b16/clip_text.xmodel
+  device_id: 0              # DPU device index
+  batch_size: 4             # DPU B4096 optimal batch
+  frames_per_window: 5      # must match PC config for index portability
+
+pipeline:
+  video_backend: gstreamer  # VVAS GStreamer plugins on Kria
+  window_sec: 5.0
+  overlap_ratio: 0.50
+
+  # VVAS-specific GStreamer element overrides
+  gst_source_element: "vvas_xmultisrc"       # hardware multi-source
+  gst_decoder_element: "vvas_xdec"           # H.264/H.265 IP core
+  gst_scaler_element: "vvas_xfilter"         # FPGA multi-scaler (NV12→BGR)
+
+index:
+  embed_dim: 512            # INT8 DPU output still projected to 512-d fp32
+  index_dir: /opt/nlvs/index_store
+
+search:
+  top_k: 5
+  score_threshold: 0.20
+  nms_iou_threshold: 0.50
+
+api:
+  host: 0.0.0.0
+  port: 8000

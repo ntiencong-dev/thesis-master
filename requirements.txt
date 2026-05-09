@@ -1,0 +1,37 @@
+# Core ML
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Vision-Language Model
+transformers>=4.35.0
+open-clip-torch>=2.20.0
+
+# Video Processing
+opencv-python>=4.8.0
+av>=11.0.0
+
+# Vector Database
+faiss-gpu>=1.7.4
+
+# Web UI
+streamlit>=1.28.0
+
+# REST API
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Config
+pyyaml>=6.0.0
+
+# Utilities
+numpy>=1.24.0
+Pillow>=10.0.0
+tqdm>=4.65.0
+
+# Optional: GStreamer Python bindings (install via system package manager)
+# sudo apt install python3-gi python3-gi-cairo gstreamer1.0-plugins-good \
+#                  gstreamer1.0-plugins-bad gstreamer1.0-libav
+
+# Optional: query translation (Vietnamese → English)
+# deep-translator>=1.11.0
