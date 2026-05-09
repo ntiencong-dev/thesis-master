@@ -11,7 +11,7 @@ ENG-02  encode_segment_frames: single frame → shape (512,), unit norm
 ENG-03  encode_segment_frames: N identical frames → same vector as single
 ENG-04  encode_segment_frames: different frames → mean is between them, re-normalised
 ENG-05  encode_segment_frames: empty list → shape (512,) zero vector
-ENG-06  PCEngine.embed_dim == 512
+ENG-06  PCEngine.embed_dim == 768  (EVA-CLIP ViT-L/14 Phase 1)
 ENG-07  PCEngine.encode_frames: single frame → shape (1, 512), norm ≈ 1.0
 ENG-08  PCEngine.encode_frames: batch of 5 frames → shape (5, 512)
 ENG-09  PCEngine.encode_text: single string → shape (1, 512), norm ≈ 1.0
@@ -89,7 +89,7 @@ def test_ENG05_encode_segment_frames_empty():
 # ── ENG-06..12  PCEngine ──────────────────────────────────────────────────
 
 def test_ENG06_pc_engine_embed_dim(clip_engine):
-    assert clip_engine.embed_dim == 512
+    assert clip_engine.embed_dim == 768   # EVA-CLIP ViT-L/14 (Phase 1)
 
 
 def test_ENG07_pc_engine_encode_single_frame(clip_engine):

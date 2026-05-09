@@ -7,10 +7,12 @@ backend: pc
 
 engine:
   type: pc                  # 'pc' → PyTorch/CLIP  |  'kria' → VART/DPU
-  model_name: ViT-B-16
-  pretrained: openai
+  # Phase 1: EVA-CLIP ViT-L/14 (RESEARCH_SOTA_NLVS.md §I1)
+  # ImageNet zero-shot 79.8% vs 68.3% (ViT-B/16), VRAM ~1.4 GB FP16
+  model_name: EVA02-L-14
+  pretrained: merged2b_s4b_b131k
   device: cuda              # auto-falls-back to 'cpu' if no CUDA
-  batch_size: 32
+  batch_size: 16            # reduced from 32: larger model, same VRAM budget
   frames_per_window: 5      # multi-frame averaging: N frames per segment
 
 pipeline:
@@ -19,7 +21,7 @@ pipeline:
   overlap_ratio: 0.50       # 50 % overlap → stride = 2.5 s
 
 index:
-  embed_dim: 512            # ViT-B/16 joint embedding dimension
+  embed_dim: 768            # EVA-CLIP ViT-L/14 joint embedding dimension (Phase 1)
   index_dir: ./index_store
 
 search:

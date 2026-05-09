@@ -29,6 +29,9 @@ numpy>=1.24.0
 Pillow>=10.0.0
 tqdm>=4.65.0
 
+# Phase 1: VI→EN query translation
+deep_translator>=1.11.0
+
 # Optional: GStreamer Python bindings (install via system package manager)
 # sudo apt install python3-gi python3-gi-cairo gstreamer1.0-plugins-good \
 #                  gstreamer1.0-plugins-bad gstreamer1.0-libav

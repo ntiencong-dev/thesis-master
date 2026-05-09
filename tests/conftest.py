@@ -32,7 +32,7 @@ VIDEO_FRAMES   = 4564
 VIDEO_DURATION = VIDEO_FRAMES / VIDEO_FPS   # ≈ 76.07 s
 VIDEO_WIDTH    = 1920
 VIDEO_HEIGHT   = 1080
-EMBED_DIM      = 512
+EMBED_DIM      = 768   # EVA-CLIP ViT-L/14 (Phase 1 upgrade)
 
 
 # ---------------------------------------------------------------------------
@@ -82,15 +82,16 @@ def clip_engine():
     """
     Load the PC CLIP engine once for the whole test session.
     Tests that need CLIP should request this fixture.
+    Phase 1: uses EVA02-L-14 (embed_dim=768) with graceful fallback to ViT-B-16.
     """
     import warnings
     warnings.filterwarnings("ignore")
     from src.engines.pc_engine import PCEngine
     engine = PCEngine({
-        "model_name": "ViT-B-16",
-        "pretrained": "openai",
+        "model_name": "EVA02-L-14",
+        "pretrained": "merged2b_s4b_b131k",
         "device": None,      # auto-detect CUDA
-        "batch_size": 32,
+        "batch_size": 16,
     })
     return engine
 

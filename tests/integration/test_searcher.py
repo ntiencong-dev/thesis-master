@@ -271,7 +271,7 @@ def test_SR21_search_debug_structure(searcher_with_real_video):
     assert {"max", "min", "mean", "median", "p75"}.issubset(dbg["score_stats"])
     # templates_used must be a non-empty list of strings
     assert isinstance(dbg["templates_used"], list)
-    assert len(dbg["templates_used"]) == 5
+    assert len(dbg["templates_used"]) == 12
 
 
 # ── SR-22  search_debug cleaned query == _normalize_query ────────────────

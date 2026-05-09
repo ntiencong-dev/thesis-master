@@ -90,10 +90,10 @@ def test_QN08_result_has_no_leading_trailing_whitespace():
 
 # ── QN-09  Five CLIP templates produced ──────────────────────────────────
 
-def test_QN09_five_templates_produced():
+def test_QN09_twelve_templates_produced():
     cleaned = "person on roof"
     templates = [t.format(cleaned) for t in _CLIP_TEMPLATES]
-    assert len(templates) == 5
+    assert len(templates) == 12
     assert cleaned in templates        # "{}" identity template must be present
 
 

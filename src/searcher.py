@@ -36,13 +36,25 @@ _QUERY_PREFIX_RE = re.compile(
 )
 
 # CLIP prompt templates — averaging their embeddings improves recall on
-# action and event queries (mirrors the ensemble strategy from the CLIP paper)
+# action and event queries (mirrors the ensemble strategy from the CLIP paper).
+# Phase 1: expanded from 5 → 12 templates, adding action/event and
+# surveillance-specific phrasings (RESEARCH_SOTA_NLVS.md §I3).
 _CLIP_TEMPLATES: List[str] = [
+    # General (original 5)
     "{}",
     "a photo of {}",
     "a video frame of {}",
     "a scene with {}",
     "an image of {}",
+    # Action / event specific
+    "a person {}",
+    "someone is {}",
+    "a video of a person {}",
+    "security camera footage of {}",
+    "surveillance video showing {}",
+    # Scene-level
+    "a scene showing {}",
+    "footage of {}",
 ]
 
 
@@ -77,10 +89,12 @@ class SearchResult:
 class NLVideoSearcher:
     _DEFAULT: dict = {
         "backend": "pc",
-        "engine":   {"type":"pc","model_name":"ViT-B-16","pretrained":"openai","device":None,"batch_size":32,"frames_per_window":5},
+        # Phase 1: default to EVA-CLIP ViT-L/14
+        "engine":   {"type":"pc","model_name":"EVA02-L-14","pretrained":"merged2b_s4b_b131k","device":None,"batch_size":16,"frames_per_window":5},
         "pipeline": {"video_backend":"opencv","window_sec":5.0,"overlap_ratio":0.50},
-        "index":    {"embed_dim":512,"index_dir":None},
-        "search":   {"top_k":5,"score_threshold":0.20,"nms_iou_threshold":0.30},
+        "index":    {"embed_dim":768,"index_dir":None},
+        "search":   {"top_k":5,"score_threshold":0.20,"nms_iou_threshold":0.30,
+                     "adaptive_threshold":True,"translate_vi":True},
     }
     def __init__(self, config=None):
         self._config = {**self._DEFAULT, **(config or {})}
@@ -92,10 +106,12 @@ class NLVideoSearcher:
         self._frames_per_window = e.get("frames_per_window", 5)
         self._video_backend     = p.get("video_backend",    "opencv")
         s = self._config.get("search", {})
-        self._default_top_k   = s.get("top_k",             5)
-        self._score_threshold = s.get("score_threshold",   0.20)
-        self._nms_iou         = s.get("nms_iou_threshold", 0.50)
-        self.index_dir        = self._config.get("index", {}).get("index_dir", None)
+        self._default_top_k      = s.get("top_k",              5)
+        self._score_threshold    = s.get("score_threshold",    0.20)
+        self._nms_iou            = s.get("nms_iou_threshold",  0.50)
+        self._adaptive_threshold = s.get("adaptive_threshold", True)
+        self._translate_vi       = s.get("translate_vi",       True)
+        self.index_dir           = self._config.get("index", {}).get("index_dir", None)
 
     @classmethod
     def from_config(cls, path: str):
@@ -103,15 +119,18 @@ class NLVideoSearcher:
 
     @classmethod
     def from_params(cls, index_dir=None, use_sliding_window=True, window_sec=5.0,
-                    overlap_ratio=0.5, frames_per_window=5, device=None):
+                    overlap_ratio=0.5, frames_per_window=5, device=None,
+                    model_name="EVA02-L-14", pretrained="merged2b_s4b_b131k",
+                    embed_dim=768):
         return cls({
             "backend": "pc",
-            "engine":  {"type":"pc","model_name":"ViT-B-16","pretrained":"openai",
-                        "device":device,"batch_size":32,"frames_per_window":frames_per_window},
+            "engine":  {"type":"pc","model_name":model_name,"pretrained":pretrained,
+                        "device":device,"batch_size":16,"frames_per_window":frames_per_window},
             "pipeline":{"video_backend":"opencv","window_sec":window_sec,
                         "overlap_ratio":overlap_ratio if use_sliding_window else 0.0},
-            "index":   {"embed_dim":512,"index_dir":index_dir},
-            "search":  {"top_k":5,"score_threshold":0.20,"nms_iou_threshold":0.30},
+            "index":   {"embed_dim":embed_dim,"index_dir":index_dir},
+            "search":  {"top_k":5,"score_threshold":0.20,"nms_iou_threshold":0.30,
+                        "adaptive_threshold":True,"translate_vi":True},
         })
 
     def index_video(self, video_path: str) -> int:
@@ -144,19 +163,34 @@ class NLVideoSearcher:
                use_templates: bool = True) -> List[SearchResult]:
         if self._index.total_vectors() == 0:
             raise RuntimeError("Index empty. Run index_video() first.")
-        k      = top_k           if top_k           is not None else self._default_top_k
-        thresh = score_threshold if score_threshold is not None else self._score_threshold
-        iou    = nms_iou         if nms_iou         is not None else self._nms_iou
+        k   = top_k   if top_k   is not None else self._default_top_k
+        iou = nms_iou if nms_iou is not None else self._nms_iou
 
         cleaned = _normalize_query(query_text)
+
+        # Phase 1 §I4: VI→EN translation
+        if self._translate_vi:
+            cleaned = self._translate_if_vietnamese(cleaned)
+
         if use_templates:
             qvec = self._encode_with_templates(cleaned)
         else:
             qvec = self._engine.encode_text(cleaned)
 
-        raw    = self._index.search(qvec, top_k=k * 4)
-        fil    = [(s, m) for s, m in raw if s >= thresh]
-        dedup  = temporal_nms(fil, iou_threshold=iou, top_k=k)
+        raw = self._index.search(qvec, top_k=k * 4)
+
+        # Phase 1 §I2: adaptive threshold
+        if score_threshold is not None:
+            thresh = score_threshold
+        elif self._adaptive_threshold:
+            thresh = self._compute_adaptive_threshold(
+                [s for s, _ in raw], self._score_threshold
+            )
+        else:
+            thresh = self._score_threshold
+
+        fil   = [(s, m) for s, m in raw if s >= thresh]
+        dedup = temporal_nms(fil, iou_threshold=iou, top_k=k)
         return [SearchResult(score=sc, video_id=m.video_id, video_path=m.video_path,
                              start_time=m.start_time, end_time=m.end_time, rank=i+1)
                 for i, (sc, m) in enumerate(dedup)]
@@ -166,14 +200,66 @@ class NLVideoSearcher:
         Encode *cleaned_query* through all CLIP prompt templates and return the
         L2-normalised mean of the resulting embeddings.
 
-        Averaging across multiple phrasings of the same query reduces sensitivity
-        to exact wording and improves recall for action/event queries.
+        Phase 1: expanded to 12 templates (action/event + surveillance-specific)
+        covering a wider variety of visual phrasings to improve recall.
         """
         texts = [t.format(cleaned_query) for t in _CLIP_TEMPLATES]
         embs  = self._engine.encode_text(texts)    # (N_templates, D)
         mean  = embs.mean(axis=0)                   # (D,)
         norm  = float(np.linalg.norm(mean))
         return (mean / norm).astype(np.float32) if norm > 1e-8 else mean
+
+    # ------------------------------------------------------------------
+    # Phase 1 helpers
+    # ------------------------------------------------------------------
+
+    def _compute_adaptive_threshold(self, raw_scores: List[float],
+                                    base_threshold: float = 0.15) -> float:
+        """
+        Adaptive score threshold based on the distribution of raw Faiss scores.
+
+        - When top-1 score is high (> 0.35): tighten threshold to suppress
+          near-duplicate low-confidence results (precision mode).
+        - When top-1 score is low  (< 0.25): fall back to base_threshold so
+          genuinely hard queries still return candidates (recall mode).
+        """
+        if not raw_scores:
+            return base_threshold
+        top1 = max(raw_scores)
+        if top1 > 0.35:
+            mean_s = float(np.mean(raw_scores))
+            std_s  = float(np.std(raw_scores))
+            return max(base_threshold, mean_s - 0.5 * std_s)
+        return base_threshold
+
+    _VI_DIACRITICS = frozenset(
+        "àáảãạăắặẳẵặâầấẩẫậđèéẻẽẹêềếểễệìíỉĩịòóỏõọôồốổỗộơờớởỡợùúủũụưừứửữựỳýỷỹỵ"
+        "ÀÁẢÃẠĂẮẶẲẴẶÂẦẤẨẪẬĐÈÉẺẼẸÊỀẾỂỄỆÌÍỈĨỊÒÓỎÕỌÔỒỐỔỖỘƠỜỚỞỠỢÙÚỦŨỤƯỪỨỬỮỰỲÝỶỸỴ"
+    )
+
+    def _translate_if_vietnamese(self, query: str) -> str:
+        """
+        Detect Vietnamese queries by diacritic ratio and translate VI→EN.
+
+        Uses `deep_translator.GoogleTranslator` when available; falls back to
+        the original query on network error or missing dependency.
+
+        Detection heuristic: if ≥ 5 % of characters are Vietnamese diacritics
+        the query is considered Vietnamese.
+        """
+        if not query:
+            return query
+        vi_ratio = sum(1 for c in query if c in self._VI_DIACRITICS) / len(query)
+        if vi_ratio < 0.05:
+            return query   # not Vietnamese
+        try:
+            from deep_translator import GoogleTranslator
+            translated = GoogleTranslator(source="vi", target="en").translate(query)
+            if translated and translated.strip():
+                return translated.strip()
+        except Exception:
+            pass   # silently fall through
+        return query
 
     def search_debug(self, query_text: str, top_k: int = 10,
                      score_threshold: float = 0.0) -> dict:
@@ -182,16 +268,19 @@ class NLVideoSearcher:
 
         Useful for understanding why a query succeeds or fails:
         - original vs cleaned query
+        - translated query (Phase 1: VI→EN)
+        - adaptive threshold value (Phase 1)
         - raw Faiss scores before NMS and threshold filtering
         - comparison: template-ensemble vs raw query
         """
         if self._index.total_vectors() == 0:
             raise RuntimeError("Index empty.")
 
-        cleaned = _normalize_query(query_text)
-        qvec_raw  = self._engine.encode_text(query_text)   # (1, D) → flatten
+        cleaned    = _normalize_query(query_text)
+        translated = self._translate_if_vietnamese(cleaned) if self._translate_vi else cleaned
+        qvec_raw   = self._engine.encode_text(query_text)
         qvec_clean = self._engine.encode_text(cleaned)
-        qvec_tmpl  = self._encode_with_templates(cleaned)
+        qvec_tmpl  = self._encode_with_templates(translated)
 
         def _top(vec, k):
             rows = self._index.search(vec, top_k=k)
@@ -199,20 +288,26 @@ class NLVideoSearcher:
                      "start": m.start_time, "end": m.end_time} for s, m in rows]
 
         raw_scores = [s for s, _ in self._index.search(qvec_tmpl, top_k=self._index.total_vectors())]
+        adaptive_thresh = (
+            self._compute_adaptive_threshold(raw_scores, self._score_threshold)
+            if self._adaptive_threshold else self._score_threshold
+        )
 
         return {
-            "query_original":  query_text,
-            "query_cleaned":   cleaned,
-            "templates_used":  [t.format(cleaned) for t in _CLIP_TEMPLATES],
-            "top_raw_query":   _top(qvec_raw,   top_k),
-            "top_clean_query": _top(qvec_clean, top_k),
-            "top_templates":   _top(qvec_tmpl,  top_k),
+            "query_original":   query_text,
+            "query_cleaned":    cleaned,
+            "query_translated": translated,
+            "templates_used":   [t.format(translated) for t in _CLIP_TEMPLATES],
+            "top_raw_query":    _top(qvec_raw,   top_k),
+            "top_clean_query":  _top(qvec_clean, top_k),
+            "top_templates":    _top(qvec_tmpl,  top_k),
             "score_stats": {
-                "max":    float(max(raw_scores)) if raw_scores else 0,
-                "min":    float(min(raw_scores)) if raw_scores else 0,
-                "mean":   float(np.mean(raw_scores)) if raw_scores else 0,
-                "median": float(np.median(raw_scores)) if raw_scores else 0,
-                "p75":    float(np.percentile(raw_scores, 75)) if raw_scores else 0,
+                "max":              float(max(raw_scores)) if raw_scores else 0,
+                "min":              float(min(raw_scores)) if raw_scores else 0,
+                "mean":             float(np.mean(raw_scores)) if raw_scores else 0,
+                "median":           float(np.median(raw_scores)) if raw_scores else 0,
+                "p75":              float(np.percentile(raw_scores, 75)) if raw_scores else 0,
+                "adaptive_thresh":  adaptive_thresh,
             },
         }
 
@@ -224,4 +319,13 @@ class NLVideoSearcher:
     def load_index(self, index_dir=None):
         s = index_dir or self.index_dir
         if not s: raise ValueError("No index_dir.")
-        self._index = VideoIndex.load(s)
+        loaded = VideoIndex.load(s)
+        if loaded.embed_dim != self._engine.embed_dim:
+            import warnings
+            warnings.warn(
+                f"[NLVideoSearcher] Stale index dim={loaded.embed_dim} "
+                f"≠ engine dim={self._engine.embed_dim}. "
+                "Discarding old index — re-run index_video() to rebuild."
+            )
+            return   # keep the empty in-memory index
+        self._index = loaded

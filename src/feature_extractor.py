@@ -58,9 +58,11 @@ class CLIPFeatureExtractor:
         Number of frames processed per forward pass.
     """
 
-    MODEL_NAME  = "ViT-B-16"
-    PRETRAINED  = "openai"
-    EMBED_DIM   = 512          # ViT-B/16 joint embedding dimension
+    # EVA-CLIP ViT-L/14 — Phase 1 upgrade (see RESEARCH_SOTA_NLVS.md §I1)
+    # ImageNet zero-shot 79.8% vs 68.3% (ViT-B/16); VRAM ~1.4 GB FP16.
+    MODEL_NAME  = "EVA02-L-14"
+    PRETRAINED  = "merged2b_s4b_b131k"
+    EMBED_DIM   = 768          # ViT-L/14 joint embedding dimension (up from 512)
 
     def __init__(
         self,
@@ -73,10 +75,26 @@ class CLIPFeatureExtractor:
         self.batch_size = batch_size
 
         if _BACKEND == "open_clip":
-            self._model, _, self._preprocess = open_clip.create_model_and_transforms(
-                model_name, pretrained=pretrained
-            )
-            self._tokenizer = open_clip.get_tokenizer(model_name)
+            try:
+                self._model, _, self._preprocess = open_clip.create_model_and_transforms(
+                    model_name, pretrained=pretrained
+                )
+                self._tokenizer = open_clip.get_tokenizer(model_name)
+            except Exception as exc:
+                # Graceful fallback to ViT-B-16 if EVA weights not downloaded yet
+                import warnings
+                warnings.warn(
+                    f"[CLIPFeatureExtractor] Failed to load {model_name!r} "
+                    f"({pretrained!r}): {exc}. "
+                    "Falling back to ViT-B-16 / openai."
+                )
+                model_name = "ViT-B-16"
+                pretrained = "openai"
+                self._model, _, self._preprocess = open_clip.create_model_and_transforms(
+                    model_name, pretrained=pretrained
+                )
+                self._tokenizer = open_clip.get_tokenizer(model_name)
+                self.EMBED_DIM = 512   # update instance EMBED_DIM on fallback
         else:
             # HuggingFace fallback
             self._hf_model     = CLIPModel.from_pretrained("openai/clip-vit-base-patch16")
