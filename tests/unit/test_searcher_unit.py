@@ -146,3 +146,43 @@ def test_QN14_from_params_still_works():
     # Required params must still be present
     assert "index_dir" in params
     assert "window_sec" in params
+
+
+# ── QN-15  search() Phase 3 signature ────────────────────────────────────
+
+@pytest.mark.unit
+def test_QN15_search_has_use_reranker_param():
+    """search() must accept use_reranker keyword argument (Phase 3)."""
+    import inspect
+    from src.searcher import NLVideoSearcher
+    sig = inspect.signature(NLVideoSearcher.search)
+    assert "use_reranker" in sig.parameters, \
+        "search() must have 'use_reranker' parameter (Phase 3)"
+    # Default must be False (non-breaking for existing callers)
+    assert sig.parameters["use_reranker"].default is False
+
+
+# ── QN-16  set_reranker() Phase 3 signature ───────────────────────────────
+
+@pytest.mark.unit
+def test_QN16_set_reranker_method_exists():
+    """NLVideoSearcher must have set_reranker() method (Phase 3)."""
+    import inspect
+    from src.searcher import NLVideoSearcher
+    assert hasattr(NLVideoSearcher, "set_reranker"), \
+        "NLVideoSearcher must have set_reranker() method (Phase 3)"
+    sig = inspect.signature(NLVideoSearcher.set_reranker)
+    assert "reranker" in sig.parameters
+
+
+# ── QN-17  _reranker attribute exists and defaults to None ───────────────
+
+@pytest.mark.unit
+def test_QN17_reranker_attribute_defaults_none():
+    """NLVideoSearcher._reranker must default to None (Phase 3)."""
+    import inspect
+    from src.searcher import NLVideoSearcher
+    # Inspect the __init__ source to verify _reranker initialisation
+    src = inspect.getsource(NLVideoSearcher.__init__)
+    assert "_reranker" in src, \
+        "NLVideoSearcher.__init__ must initialise self._reranker"

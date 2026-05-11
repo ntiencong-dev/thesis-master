@@ -55,7 +55,15 @@ def create_engine(config: dict) -> InferenceEngine:
         from .siglip_engine import SigLIPEngine
         return SigLIPEngine(engine_cfg)
 
+    if engine_type == "languagebind":
+        from .languagebind_engine import LanguageBindEngine
+        return LanguageBindEngine(engine_cfg)
+
+    if engine_type == "internvideo2":
+        from .intern_video2_engine import InternVideo2Engine
+        return InternVideo2Engine(engine_cfg)
+
     raise ValueError(
         f"Unknown engine type '{engine_type}'. "
-        "Valid options: 'pc', 'kria'."
+        "Valid options: 'pc', 'kria', 'xclip', 'siglip', 'languagebind', 'internvideo2'."
     )

@@ -33,6 +33,9 @@ SR-22  search_debug query_cleaned matches _normalize_query() output
 SR-23  index_video with use_scene_detection=True returns positive count (Phase 2)
 SR-24  index_video scene detection: result count is positive integer
 SR-25  index_video scene detection: all indexed segments have valid timestamps
+SR-26  search(use_reranker=False) without attached reranker gives same results (Phase 3)
+SR-27  set_reranker() attached; use_reranker=False bypasses reranker (Phase 3)
+SR-28  search(use_reranker=True) with mock reranker: reranker.rerank() called (Phase 3)
 """
 
 from __future__ import annotations
@@ -324,3 +327,76 @@ def test_SR25_scene_detection_valid_timestamps(real_video_path):
             f"end_time {r.end_time} <= start_time {r.start_time}"
         assert r.end_time <= VIDEO_DURATION + 1.0, \
             f"end_time {r.end_time} > video duration {VIDEO_DURATION}"
+
+
+# ── SR-26..28  Phase 3: two-stage reranking integration ──────────────────
+
+def test_SR26_search_use_reranker_false_no_error(searcher_with_real_video):
+    """
+    search(use_reranker=False) must work correctly without any reranker attached.
+    Results must be identical to default search().
+    """
+    r1 = searcher_with_real_video.search("person walking", top_k=5,
+                                          score_threshold=0.0, use_reranker=False)
+    r2 = searcher_with_real_video.search("person walking", top_k=5,
+                                          score_threshold=0.0)
+    assert len(r1) == len(r2)
+    for a, b in zip(r1, r2):
+        assert abs(a.score - b.score) < 1e-6
+        assert a.video_id == b.video_id
+        assert a.start_time == b.start_time
+
+
+def test_SR27_set_reranker_then_search_without_flag(searcher_with_real_video):
+    """
+    Even after attaching a mock reranker, search(use_reranker=False) must
+    bypass it and return the same results as baseline.
+    """
+    from unittest.mock import MagicMock
+    mock_reranker = MagicMock()
+    mock_reranker.rerank.side_effect = AssertionError("rerank must not be called")
+
+    searcher_with_real_video.set_reranker(mock_reranker)
+    # Should NOT call reranker when use_reranker=False
+    results = searcher_with_real_video.search(
+        "person walking", top_k=5, score_threshold=0.0, use_reranker=False
+    )
+    mock_reranker.rerank.assert_not_called()
+    # Restore
+    searcher_with_real_video.set_reranker(None)
+    assert len(results) >= 0   # basic sanity
+
+
+def test_SR28_mock_reranker_called_when_flag_true(searcher_with_real_video):
+    """
+    search(use_reranker=True) with a mock reranker must call reranker.rerank()
+    and return its output as SearchResult objects.
+    """
+    from unittest.mock import MagicMock
+    from src.searcher import SearchResult
+
+    # Build a mock reranker that returns reversed-rank results
+    class _FakeRerankResult:
+        def __init__(self, score, vid_id, vid_path, start, end, rank):
+            self.score      = score
+            self.video_id   = vid_id
+            self.video_path = vid_path
+            self.start_time = start
+            self.end_time   = end
+            self.rank       = rank
+
+    mock_reranker = MagicMock()
+    mock_reranker.rerank.return_value = [
+        _FakeRerankResult(0.99, "vid0", "/fake/vid0.mp4", 0.0, 5.0, 1),
+    ]
+
+    searcher_with_real_video.set_reranker(mock_reranker)
+    results = searcher_with_real_video.search(
+        "person", top_k=5, score_threshold=0.0, use_reranker=True
+    )
+    mock_reranker.rerank.assert_called_once()
+    assert len(results) == 1
+    assert results[0].score == pytest.approx(0.99)
+    assert isinstance(results[0], SearchResult)
+    # Restore
+    searcher_with_real_video.set_reranker(None)

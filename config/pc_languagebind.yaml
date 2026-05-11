@@ -1,0 +1,30 @@
+# config/pc_languagebind.yaml
+# LanguageBind Video-FT engine configuration (Phase 3)
+# VRAM: ~1.7 GB FP16 on GTX 1650 Ti (4 GB)
+# MSR-VTT R@1: 55.6% (vs EVA-CLIP 49.3% on this task)
+# Reference: RESEARCH_SOTA_NLVS.md §III1
+
+engine:
+  type: languagebind
+  model_name: "LanguageBind/LanguageBind_Video_FT"
+  tokenizer_name: "LanguageBind/LanguageBind_Image"
+  device: null          # null = auto-detect (CUDA if available, else CPU)
+  batch_size: 4
+  frames_per_window: 14   # LanguageBind temporal window (14 frames)
+
+pipeline:
+  video_backend: opencv
+  window_sec: 5.0
+  overlap_ratio: 0.50
+
+index:
+  embed_dim: 768          # ViT-L/14 output dimension
+  index_dir: ./index_store_languagebind
+  index_type: flat        # "flat" (exact) | "ivf" (approximate, N > 500K)
+
+search:
+  top_k: 5
+  score_threshold: 0.20
+  nms_iou_threshold: 0.30
+  adaptive_threshold: true
+  translate_vi: false      # LanguageBind is natively multilingual; skip VI→EN

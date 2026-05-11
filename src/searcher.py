@@ -113,6 +113,9 @@ class NLVideoSearcher:
         self._translate_vi       = s.get("translate_vi",       True)
         self.index_dir           = self._config.get("index", {}).get("index_dir", None)
 
+        # Phase 3: optional BLIP-2 reranker (None by default)
+        self._reranker = None
+
     @classmethod
     def from_config(cls, path: str):
         with open(path) as f: return cls(yaml.safe_load(f))
@@ -191,7 +194,7 @@ class NLVideoSearcher:
         return total
 
     def search(self, query_text: str, top_k=None, score_threshold=None, nms_iou=None,
-               use_templates: bool = True) -> List[SearchResult]:
+               use_templates: bool = True, use_reranker: bool = False) -> List[SearchResult]:
         if self._index.total_vectors() == 0:
             raise RuntimeError("Index empty. Run index_video() first.")
         k   = top_k   if top_k   is not None else self._default_top_k
@@ -222,9 +225,45 @@ class NLVideoSearcher:
 
         fil   = [(s, m) for s, m in raw if s >= thresh]
         dedup = temporal_nms(fil, iou_threshold=iou, top_k=k)
-        return [SearchResult(score=sc, video_id=m.video_id, video_path=m.video_path,
-                             start_time=m.start_time, end_time=m.end_time, rank=i+1)
-                for i, (sc, m) in enumerate(dedup)]
+        results = [SearchResult(score=sc, video_id=m.video_id, video_path=m.video_path,
+                                start_time=m.start_time, end_time=m.end_time, rank=i+1)
+                   for i, (sc, m) in enumerate(dedup)]
+
+        # Phase 3: two-stage retrieval via BLIP-2 reranker
+        if use_reranker and self._reranker is not None:
+            reranked = self._reranker.rerank(results, cleaned, top_k=k)
+            results = [
+                SearchResult(
+                    score=r.score,
+                    video_id=r.video_id,
+                    video_path=r.video_path,
+                    start_time=r.start_time,
+                    end_time=r.end_time,
+                    rank=r.rank,
+                )
+                for r in reranked
+            ]
+
+        return results
+
+    def set_reranker(self, reranker) -> None:
+        """
+        Attach a BLIP-2 reranker to this searcher instance.
+
+        Parameters
+        ----------
+        reranker : BLIP2Reranker | None
+            A ``BLIP2Reranker`` instance (from ``src.reranker``), or None to
+            disable reranking.  Passing a reranker does **not** load the model
+            immediately when ``lazy_load=True`` (default).
+
+        Example
+        -------
+            from src.reranker import BLIP2Reranker
+            searcher.set_reranker(BLIP2Reranker(device="cpu"))
+            results = searcher.search("person climbing fence", use_reranker=True)
+        """
+        self._reranker = reranker
 
     def _encode_with_templates(self, cleaned_query: str) -> np.ndarray:
         """

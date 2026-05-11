@@ -186,6 +186,185 @@ class VideoIndex:
 
 
 # ---------------------------------------------------------------------------
+# Scalable index (IVFFlat for large collections)
+# ---------------------------------------------------------------------------
+
+class ScalableVideoIndex(VideoIndex):
+    """
+    Extends VideoIndex with an IVFFlat index for large-scale collections
+    (N > 500 K vectors).
+
+    When ``index_type="flat"`` (default when N is small) the behaviour is
+    identical to the parent :class:`VideoIndex`.  When ``index_type="ivf"``
+    Faiss ``IndexIVFFlat`` is used:
+
+    - **nlist** centroids are trained via k-means.  Requires ≥ ``39 * nlist``
+      training vectors (Faiss minimum).  If the collection is too small,
+      the index automatically falls back to ``IndexFlatIP``.
+    - **nprobe** centroids are visited per query (speed/recall trade-off).
+
+    Parameters
+    ----------
+    embed_dim : int
+    index_type : {"flat", "ivf"}
+        "flat" → IndexFlatIP (exact), "ivf" → IndexIVFFlat (approximate).
+    nlist : int
+        Number of IVF centroids.  Typical: 1024 for ~1 M vectors.
+    nprobe : int
+        Centroids to visit at query time.  Higher → better recall, slower.
+    use_gpu : bool
+
+    Notes
+    -----
+    IVFFlat must be trained before adding vectors.  Call ``train()`` with a
+    representative sample of all embeddings before the first ``add()`` call,
+    or collect vectors first and call ``build_and_train(all_vecs)`` which
+    handles training + adding in one shot.
+    """
+
+    MIN_TRAIN_RATIO = 39   # Faiss requirement: nlist * 39 training vectors
+
+    def __init__(
+        self,
+        embed_dim: int = 512,
+        index_type: str = "flat",
+        nlist: int = 1024,
+        nprobe: int = 64,
+        use_gpu: bool = True,
+    ) -> None:
+        self.embed_dim  = embed_dim
+        self._meta: List[SegmentMeta] = []
+        self._on_gpu: bool = False
+        self._index_type  = index_type.lower()
+        self._nlist       = nlist
+        self._nprobe      = nprobe
+        self._is_trained  = False   # tracks IVF training state
+
+        self._index = self._build_index()
+        if use_gpu:
+            self._move_to_gpu()
+
+    # ------------------------------------------------------------------
+    # Training (IVF only)
+    # ------------------------------------------------------------------
+
+    def train(self, embeddings: np.ndarray) -> None:
+        """
+        Train the IVF index using *embeddings* as the training set.
+
+        For ``index_type="flat"`` this is a no-op (IndexFlatIP is always
+        trained).  For ``index_type="ivf"`` the index must be trained before
+        any ``add()`` calls.
+
+        Parameters
+        ----------
+        embeddings : np.ndarray, shape (N, D), float32, L2-normalised.
+        """
+        if self._index_type == "flat":
+            self._is_trained = True
+            return
+
+        n = embeddings.shape[0]
+        min_required = self._nlist * self.MIN_TRAIN_RATIO
+        if n < min_required:
+            # Not enough vectors: silently fall back to flat index
+            print(
+                f"[ScalableVideoIndex] Only {n} training vectors, need "
+                f"{min_required} for IVFFlat with nlist={self._nlist}. "
+                f"Falling back to IndexFlatIP."
+            )
+            self._index = faiss.IndexFlatIP(self.embed_dim)
+            self._index_type = "flat"
+            self._is_trained = True
+            return
+
+        vecs = np.ascontiguousarray(embeddings, dtype=np.float32)
+        # Move to CPU for training if on GPU (faiss-gpu training can be finicky)
+        if self._on_gpu and hasattr(faiss, "index_gpu_to_cpu"):
+            cpu_idx = faiss.index_gpu_to_cpu(self._index)
+            cpu_idx.train(vecs)
+            # Move back to GPU
+            res = faiss.StandardGpuResources()
+            self._index = faiss.index_cpu_to_gpu(res, 0, cpu_idx)
+        else:
+            self._index.train(vecs)
+
+        # Set nprobe on the (possibly wrapped) index
+        self._set_nprobe()
+        self._is_trained = True
+        print(f"[ScalableVideoIndex] IVFFlat trained with {n} vectors.")
+
+    def build_and_train(
+        self, embeddings: np.ndarray, metadata: List[SegmentMeta]
+    ) -> None:
+        """
+        Convenience: train on *embeddings* then add them all at once.
+
+        Parameters
+        ----------
+        embeddings : np.ndarray, shape (N, D), float32.
+        metadata   : List[SegmentMeta], length N.
+        """
+        self.train(embeddings)
+        self.add(embeddings, metadata)
+
+    def add(self, embeddings: np.ndarray, metadata: List[SegmentMeta]) -> None:
+        """Add embeddings; trains a flat fall-back automatically if IVF not yet trained."""
+        if self._index_type == "ivf" and not self._is_trained:
+            # Auto-train when first batch arrives (only valid for flat fall-back)
+            self.train(embeddings)
+        super().add(embeddings, metadata)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _build_index(self) -> faiss.Index:
+        """Create and return the underlying Faiss index (CPU)."""
+        if self._index_type == "flat":
+            return faiss.IndexFlatIP(self.embed_dim)
+
+        if self._index_type == "ivf":
+            quantiser = faiss.IndexFlatIP(self.embed_dim)
+            index = faiss.IndexIVFFlat(
+                quantiser, self.embed_dim, self._nlist, faiss.METRIC_INNER_PRODUCT
+            )
+            return index
+
+        raise ValueError(
+            f"Unknown index_type '{self._index_type}'. Choose 'flat' or 'ivf'."
+        )
+
+    def _set_nprobe(self) -> None:
+        """Apply nprobe setting to the Faiss IVF index."""
+        try:
+            # GPU-wrapped index: unwrap to set parameter
+            if hasattr(self._index, "getNumLists"):
+                self._index.setNumProbes(self._nprobe)
+            elif hasattr(self._index, "nprobe"):
+                self._index.nprobe = self._nprobe
+        except Exception:
+            pass   # nprobe not applicable (flat fallback)
+
+    @classmethod
+    def load(cls, index_dir: str, use_gpu: bool = True) -> "ScalableVideoIndex":  # type: ignore[override]
+        """Load a saved ScalableVideoIndex; delegates to parent then patches."""
+        # Re-use parent load logic which returns a plain VideoIndex instance
+        parent = VideoIndex.load(index_dir, use_gpu=use_gpu)
+
+        instance = cls.__new__(cls)
+        instance.embed_dim   = parent.embed_dim
+        instance._meta       = parent._meta
+        instance._index      = parent._index
+        instance._on_gpu     = parent._on_gpu
+        instance._index_type = "flat"   # saved indexes are flat by default
+        instance._nlist      = 1024
+        instance._nprobe     = 64
+        instance._is_trained = True
+        return instance
+
+
+# ---------------------------------------------------------------------------
 # Temporal Non-Maximum Suppression (module-level utilities)
 # ---------------------------------------------------------------------------
 

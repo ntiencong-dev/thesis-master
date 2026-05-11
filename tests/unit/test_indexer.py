@@ -50,7 +50,7 @@ import numpy as np
 import pytest
 
 from tests.conftest import EMBED_DIM, make_random_unit_vectors
-from src.indexer import VideoIndex, SegmentMeta, temporal_nms, calculate_iou
+from src.indexer import VideoIndex, ScalableVideoIndex, SegmentMeta, temporal_nms, calculate_iou
 
 pytestmark = pytest.mark.unit
 
@@ -417,3 +417,126 @@ def test_NMS12_iou_equal_threshold_not_suppressed():
     ]
     kept = temporal_nms(candidates, iou_threshold=0.5)
     assert len(kept) == 2, "IoU == threshold should NOT suppress (condition is strict >)"
+
+
+# ==========================================================================
+#  Phase 3: ScalableVideoIndex (IVFFlat) tests
+# ==========================================================================
+
+@pytest.mark.unit
+def test_SIDX01_scalable_index_importable():
+    """ScalableVideoIndex must be importable from src.indexer."""
+    from src.indexer import ScalableVideoIndex
+    assert hasattr(ScalableVideoIndex, "MIN_TRAIN_RATIO")
+
+
+@pytest.mark.unit
+def test_SIDX02_flat_mode_identical_to_video_index():
+    """ScalableVideoIndex(index_type='flat') must behave like VideoIndex."""
+    from src.indexer import ScalableVideoIndex
+    idx  = ScalableVideoIndex(embed_dim=EMBED_DIM, index_type="flat", use_gpu=False)
+    vecs = make_random_unit_vectors(5)
+    meta = _make_meta(5)
+    idx.add(vecs, meta)
+    assert idx.total_vectors() == 5
+
+
+@pytest.mark.unit
+def test_SIDX03_flat_mode_search_returns_correct_hits():
+    """Flat ScalableVideoIndex.search() must return correct matches."""
+    from src.indexer import ScalableVideoIndex
+    idx  = ScalableVideoIndex(embed_dim=EMBED_DIM, index_type="flat", use_gpu=False)
+    vecs = make_random_unit_vectors(8)
+    meta = _make_meta(8)
+    idx.add(vecs, meta)
+    results = idx.search(vecs[3], top_k=1)
+    assert results
+    score, _ = results[0]
+    assert score > 0.999
+
+
+@pytest.mark.unit
+def test_SIDX04_ivf_index_fallback_when_too_small():
+    """
+    When N < nlist * 39, IVFFlat training must fall back to IndexFlatIP
+    and still accept add() without raising.
+    """
+    from src.indexer import ScalableVideoIndex
+    nlist = 128
+    n     = 10   # far fewer than 128 * 39 = 4992
+    idx   = ScalableVideoIndex(
+        embed_dim=EMBED_DIM, index_type="ivf", nlist=nlist, use_gpu=False
+    )
+    vecs = make_random_unit_vectors(n)
+    meta = _make_meta(n)
+    # add() triggers auto-train → should detect undersized collection → fallback
+    idx.add(vecs, meta)
+    assert idx.total_vectors() == n, "Fallback flat index must still accept vectors"
+    assert idx._index_type == "flat", "After fallback, _index_type must be 'flat'"
+
+
+@pytest.mark.unit
+def test_SIDX05_train_flat_is_noop():
+    """Calling train() on flat ScalableVideoIndex sets _is_trained=True."""
+    from src.indexer import ScalableVideoIndex
+    idx = ScalableVideoIndex(embed_dim=EMBED_DIM, index_type="flat", use_gpu=False)
+    vecs = make_random_unit_vectors(20)
+    idx.train(vecs)
+    assert idx._is_trained is True
+
+
+@pytest.mark.unit
+def test_SIDX06_build_and_train_convenience():
+    """build_and_train() must train + add in one shot (flat fallback)."""
+    from src.indexer import ScalableVideoIndex
+    idx  = ScalableVideoIndex(embed_dim=EMBED_DIM, index_type="ivf", nlist=64, use_gpu=False)
+    vecs = make_random_unit_vectors(15)   # <  64 * 39 → fallback
+    meta = _make_meta(15)
+    idx.build_and_train(vecs, meta)
+    assert idx.total_vectors() == 15
+
+
+@pytest.mark.unit
+def test_SIDX07_unknown_index_type_raises():
+    """ScalableVideoIndex with unknown index_type must raise ValueError."""
+    from src.indexer import ScalableVideoIndex
+    idx = ScalableVideoIndex.__new__(ScalableVideoIndex)
+    idx.embed_dim   = EMBED_DIM
+    idx._index_type = "hnsw"   # unsupported
+    with pytest.raises(ValueError, match="Unknown index_type"):
+        idx._build_index()
+
+
+@pytest.mark.unit
+def test_SIDX08_flat_save_load_round_trip(tmp_index_dir):
+    """ScalableVideoIndex (flat) must survive save → load round-trip."""
+    from src.indexer import ScalableVideoIndex
+    idx  = ScalableVideoIndex(embed_dim=EMBED_DIM, index_type="flat", use_gpu=False)
+    vecs = make_random_unit_vectors(6)
+    meta = _make_meta(6)
+    idx.add(vecs, meta)
+    idx.save(tmp_index_dir)
+
+    loaded = ScalableVideoIndex.load(tmp_index_dir, use_gpu=False)
+    assert loaded.total_vectors() == 6
+    results = loaded.search(vecs[0], top_k=1)
+    assert results[0][0] > 0.999
+
+
+@pytest.mark.unit
+def test_SIDX09_embed_dim_preserved():
+    """ScalableVideoIndex.embed_dim must match constructor value."""
+    from src.indexer import ScalableVideoIndex
+    idx = ScalableVideoIndex(embed_dim=EMBED_DIM, index_type="flat", use_gpu=False)
+    assert idx.embed_dim == EMBED_DIM
+
+
+@pytest.mark.unit
+def test_SIDX10_add_count_mismatch_raises():
+    """ScalableVideoIndex.add() must raise ValueError on size mismatch."""
+    from src.indexer import ScalableVideoIndex
+    idx  = ScalableVideoIndex(embed_dim=EMBED_DIM, index_type="flat", use_gpu=False)
+    vecs = make_random_unit_vectors(3)
+    meta = _make_meta(5)  # mismatch
+    with pytest.raises(ValueError):
+        idx.add(vecs, meta)
