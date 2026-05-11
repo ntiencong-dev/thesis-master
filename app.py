@@ -131,6 +131,9 @@ def _reset_searcher() -> None:
     """Force a new searcher instance (called when settings change)."""
     st.session_state.pop("searcher", None)
     st.session_state["indexed"] = False
+    # Clear cached results so stale results are not shown after a reset
+    for _k in ("_results", "_query", "_elapsed", "_norm_note"):
+        st.session_state.pop(_k, None)
 
 
 # ---------------------------------------------------------------------------
@@ -292,10 +295,12 @@ search_btn = st.button("Search", type="primary", disabled=not indexed or not que
 if search_btn and query:
     searcher = _get_searcher()
 
-    # Show normalised query so the user can see what CLIP actually encodes
+    # Compute and cache the normalisation note
     cleaned = _normalize_query(query)
-    if cleaned.lower() != query.strip().lower():
-        st.caption(f'Query normalised: **"{query}"** → **"{cleaned}"**')
+    st.session_state["_norm_note"] = (
+        f'Query normalised: **"{query}"** → **"{cleaned}"**'
+        if cleaned.lower() != query.strip().lower() else ""
+    )
 
     with st.spinner("Searching …"):
         t0 = time.perf_counter()
@@ -307,11 +312,26 @@ if search_btn and query:
         )
         elapsed = time.perf_counter() - t0
 
+    # Persist results so that download_button reruns do not lose this page
+    st.session_state["_results"] = results
+    st.session_state["_query"]   = query
+    st.session_state["_elapsed"] = elapsed
+
+# ── Display results — runs on every rerun (including download_button clicks) ─
+if "_results" in st.session_state:
+    results    = st.session_state["_results"]
+    elapsed    = st.session_state["_elapsed"]
+    last_query = st.session_state["_query"]
+
+    norm_note = st.session_state.get("_norm_note", "")
+    if norm_note:
+        st.caption(norm_note)
+
     # ── Debug panel ────────────────────────────────────────────────────────
     if show_debug:
         with st.expander("Vector diagnostics", expanded=True):
             try:
-                dbg = searcher.search_debug(query, top_k=10, score_threshold=0.0)
+                dbg = _get_searcher().search_debug(last_query, top_k=10, score_threshold=0.0)
                 col_a, col_b = st.columns(2)
                 with col_a:
                     st.markdown("**Score statistics (all segments)**")
