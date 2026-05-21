@@ -48,12 +48,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Directory to save the Faiss index.",
     )
     idx.add_argument(
-        "--window-sec", type=float, default=5.0,
+        "--window-sec", type=float, default=10.0,
         help="Sliding-window duration (seconds).",
     )
     idx.add_argument(
-        "--overlap", type=float, default=0.5,
-        help="Overlap ratio [0, 1). 0.5 = 50 %.",
+        "--overlap", type=float, default=0.30,
+        help="Overlap ratio [0, 1). 0.30 = 30%%.",
     )
     idx.add_argument(
         "--keyframe", action="store_true",

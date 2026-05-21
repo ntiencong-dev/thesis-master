@@ -73,8 +73,8 @@ class VideoPipeline:
     def __init__(
         self,
         video_path: str,
-        window_sec: float = 5.0,
-        stride_sec: float = 2.5,
+        window_sec: float = 10.0,
+        stride_sec: float = 7.0,
         frames_per_window: int = 5,
         backend: str = "opencv",
         gst_overrides: Optional[dict] = None,
@@ -95,8 +95,8 @@ class VideoPipeline:
         pipe_cfg = config.get("pipeline", {})
         eng_cfg  = config.get("engine", {})
 
-        window_sec  = pipe_cfg.get("window_sec", 5.0)
-        overlap     = pipe_cfg.get("overlap_ratio", 0.5)
+        window_sec  = pipe_cfg.get("window_sec", 10.0)
+        overlap     = pipe_cfg.get("overlap_ratio", 0.30)
         stride_sec  = window_sec * (1.0 - overlap)
         fpw         = eng_cfg.get("frames_per_window", 5)
         backend     = pipe_cfg.get("video_backend", "opencv")

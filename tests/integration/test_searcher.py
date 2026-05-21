@@ -377,13 +377,16 @@ def test_SR28_mock_reranker_called_when_flag_true(searcher_with_real_video):
 
     # Build a mock reranker that returns reversed-rank results
     class _FakeRerankResult:
-        def __init__(self, score, vid_id, vid_path, start, end, rank):
-            self.score      = score
-            self.video_id   = vid_id
-            self.video_path = vid_path
-            self.start_time = start
-            self.end_time   = end
-            self.rank       = rank
+        def __init__(self, score, cam_id, vid_path, start, end, rank):
+            self.score          = score
+            self.cam_id         = cam_id
+            self.video_id       = cam_id   # backward-compat alias
+            self.video_path     = vid_path
+            self.start_time     = start
+            self.end_time       = end
+            self.rank           = rank
+            self.absolute_start = 0.0
+            self.absolute_end   = 0.0
 
     mock_reranker = MagicMock()
     mock_reranker.rerank.return_value = [
@@ -400,3 +403,55 @@ def test_SR28_mock_reranker_called_when_flag_true(searcher_with_real_video):
     assert isinstance(results[0], SearchResult)
     # Restore
     searcher_with_real_video.set_reranker(None)
+
+
+# ── SR-29  from_config(pc.yaml) loads with qdrant backend attributes ──────
+
+def test_SR29_from_config_has_qdrant_attributes():
+    """
+    from_config(pc.yaml) must populate _qdrant_client/_qdrant_collection
+    attributes on NLVideoSearcher (either set or None, but always present).
+    Skip if config file is missing.
+    """
+    import warnings; warnings.filterwarnings("ignore")
+    from src.searcher import NLVideoSearcher
+
+    config_path = os.path.join(
+        os.path.dirname(__file__), "..", "..", "config", "pc.yaml"
+    )
+    if not os.path.isfile(config_path):
+        pytest.skip("config/pc.yaml not found")
+
+    s = NLVideoSearcher.from_config(config_path)
+    assert hasattr(s, "_qdrant_client"), \
+        "NLVideoSearcher must have _qdrant_client attribute"
+    assert hasattr(s, "_qdrant_collection"), \
+        "NLVideoSearcher must have _qdrant_collection attribute"
+
+
+# ── SR-30  search on mock-empty Qdrant returns [] (no RuntimeError) ───────
+
+def test_SR30_qdrant_client_wired_returns_empty_list():
+    """
+    search() on an NLVideoSearcher backed by a Qdrant client that returns no
+    results must return [] (not raise RuntimeError).  The RuntimeError guard
+    only fires when both Qdrant is absent AND the Faiss index is empty.
+    """
+    import warnings; warnings.filterwarnings("ignore")
+    from unittest.mock import MagicMock
+    from src.searcher import NLVideoSearcher
+
+    s = NLVideoSearcher.from_params(
+        use_sliding_window=True,
+        window_sec=5.0,
+        overlap_ratio=0.5,
+        frames_per_window=2,
+    )
+    # Wire up a mock Qdrant that returns zero hits
+    mock_client = MagicMock()
+    mock_client.search.return_value = []
+    s._qdrant_client     = mock_client
+    s._qdrant_collection = "nlvs_segments"
+
+    results = s.search("person", top_k=5, score_threshold=0.0)
+    assert results == [], "Wired-but-empty Qdrant should return [] not raise"

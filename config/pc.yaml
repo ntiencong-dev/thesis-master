@@ -1,5 +1,6 @@
 # ============================================================
-# NLVS — PC Prototype Configuration (GTX 1650 Ti, CUDA)
+# NLVS — PC / WSL2 Configuration (GTX 1650 Ti, CUDA)
+# Confirmed params: window=10s · overlap=30% · frames=5 · min_score=0.20
 # Switch to kria.yaml for AMD Kria KV260 deployment.
 # ============================================================
 
@@ -12,22 +13,34 @@ engine:
   model_name: EVA02-L-14
   pretrained: merged2b_s4b_b131k
   device: cuda              # auto-falls-back to 'cpu' if no CUDA
-  batch_size: 16            # reduced from 32: larger model, same VRAM budget
-  frames_per_window: 5      # multi-frame averaging: N frames per segment
+  batch_size: 16
+  frames_per_window: 5      # confirmed — multi-frame averaging per segment
 
 pipeline:
   video_backend: opencv     # 'opencv' (default) | 'gstreamer'
-  window_sec: 5.0           # sliding-window duration
-  overlap_ratio: 0.50       # 50 % overlap → stride = 2.5 s
+  window_sec: 10.0          # confirmed — sliding-window duration
+  overlap_ratio: 0.30       # confirmed — 30% overlap → stride = 7.0 s
 
 index:
-  embed_dim: 768            # EVA-CLIP ViT-L/14 joint embedding dimension (Phase 1)
-  index_dir: ./index_store
+  embed_dim: 768            # EVA-CLIP ViT-L/14 embedding dimension
+  index_dir: ./index_store  # Faiss fallback path (used when Qdrant is unreachable)
+  backend: qdrant           # unified with Kria — same workflow on both platforms
+  qdrant_url: http://localhost:6333
+  qdrant_collection: nlvs_segments
+
+capture:
+  storage_dirs:
+    - ./segments            # local capture output (app.py default)
+  segment_sec: 60
+  stride_sec: 50
+
+job_queue:
+  db_path: ./segments/job_queue.db
 
 search:
   top_k: 5
-  score_threshold: 0.20     # drop results below this cosine similarity
-  nms_iou_threshold: 0.50   # temporal NMS: merge windows with IoU > 50 %
+  score_threshold: 0.10     # lowered from 0.20 — EVA-CLIP scores ~0.15-0.18 on screen-capture video
+  nms_iou_threshold: 0.30   # temporal NMS: merge windows with IoU > 30%
 
 api:
   host: 0.0.0.0

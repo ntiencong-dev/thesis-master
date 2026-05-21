@@ -12,6 +12,7 @@ av>=11.0.0
 
 # Vector Database
 faiss-gpu>=1.7.4
+qdrant-client>=1.7.0
 
 # Web UI
 streamlit>=1.28.0

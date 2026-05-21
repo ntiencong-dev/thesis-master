@@ -18,8 +18,8 @@ QN-09  Five CLIP templates produced from a cleaned query
 QN-10  Every template in _CLIP_TEMPLATES contains exactly one "{}" placeholder
 QN-11  "locate <X>" stripped
 QN-12  "can you find <X>" stripped
-QN-13  index_video accepts use_scene_detection keyword parameter (Phase 2)
-QN-14  NLVideoSearcher.from_params signature still works (regression)
+QN-21  _search_qdrant uses query_points() not search() (qdrant-client ≥1.7)
+QN-22  Default score_threshold is 0.10 (lowered for screen-capture EVA-CLIP)
 """
 
 from __future__ import annotations
@@ -186,3 +186,114 @@ def test_QN17_reranker_attribute_defaults_none():
     src = inspect.getsource(NLVideoSearcher.__init__)
     assert "_reranker" in src, \
         "NLVideoSearcher.__init__ must initialise self._reranker"
+
+
+# ── QN-18  _qdrant_client defaults to None ───────────────────────────────
+
+@pytest.mark.unit
+def test_QN18_qdrant_client_attribute_exists():
+    """__init__ must initialise _qdrant_client (None by default)."""
+    import inspect
+    from src.searcher import NLVideoSearcher
+    src = inspect.getsource(NLVideoSearcher.__init__)
+    assert "_qdrant_client" in src, \
+        "NLVideoSearcher.__init__ must initialise self._qdrant_client"
+
+
+# ── QN-19  _init_qdrant sets client when Qdrant is reachable (mocked) ────
+
+@pytest.mark.unit
+def test_QN19_init_qdrant_sets_client_when_reachable():
+    """_init_qdrant() must set _qdrant_client when connection succeeds."""
+    from unittest.mock import MagicMock, patch
+    from src.searcher import NLVideoSearcher
+
+    mock_client = MagicMock()
+    mock_client.get_collections.return_value.collections = []
+
+    with patch("qdrant_client.QdrantClient", return_value=mock_client):
+        searcher = MagicMock(spec=NLVideoSearcher)
+        searcher._qdrant_client = None
+        searcher._qdrant_collection = None
+        searcher._engine = MagicMock()
+        searcher._engine.embed_dim = 768
+        # Call the actual _init_qdrant bound to our mock
+        NLVideoSearcher._init_qdrant(searcher, {
+            "qdrant_url": "http://localhost:6333",
+            "qdrant_collection": "nlvs_segments",
+            "embed_dim": 768,
+        })
+
+    assert searcher._qdrant_client is not None
+    assert searcher._qdrant_collection == "nlvs_segments"
+
+
+# ── QN-20  _init_qdrant leaves client None when Qdrant is unreachable ────
+
+@pytest.mark.unit
+def test_QN20_init_qdrant_fallback_when_unreachable():
+    """_init_qdrant() must leave _qdrant_client as None on connection error."""
+    from unittest.mock import MagicMock, patch
+    from src.searcher import NLVideoSearcher
+
+    with patch("qdrant_client.QdrantClient", side_effect=Exception("refused")):
+        searcher = MagicMock(spec=NLVideoSearcher)
+        searcher._qdrant_client = None
+        searcher._qdrant_collection = None
+        searcher._engine = MagicMock()
+        searcher._engine.embed_dim = 768
+        NLVideoSearcher._init_qdrant(searcher, {
+            "qdrant_url": "http://localhost:6333",
+            "qdrant_collection": "nlvs_segments",
+            "embed_dim": 768,
+        })
+
+    assert searcher._qdrant_client is None
+
+
+# ── QN-21  _search_qdrant uses query_points (qdrant-client ≥1.7) ─────────
+
+@pytest.mark.unit
+def test_QN21_search_qdrant_uses_query_points():
+    """_search_qdrant must call client.query_points(), not client.search()."""
+    from unittest.mock import MagicMock
+    import numpy as np
+    from src.searcher import NLVideoSearcher
+
+    mock_client = MagicMock()
+    # Simulate qdrant-client ≥1.7: no .search() attr, only .query_points()
+    del mock_client.search
+    scored_point = MagicMock()
+    scored_point.score = 0.15
+    scored_point.payload = {
+        "cam_id": "cam01", "video_path": "/tmp/a.mp4",
+        "relative_start": 0.0, "relative_end": 10.0,
+        "segment_wall_start": 0.0, "absolute_start": 0.0, "absolute_end": 10.0,
+    }
+    mock_response = MagicMock()
+    mock_response.points = [scored_point]
+    mock_client.query_points.return_value = mock_response
+
+    searcher = MagicMock(spec=NLVideoSearcher)
+    searcher._qdrant_client = mock_client
+    searcher._qdrant_collection = "nlvs_segments"
+
+    qvec = np.ones((1, 768), dtype=np.float32)
+    results = NLVideoSearcher._search_qdrant(searcher, qvec, top_k=5)
+
+    mock_client.query_points.assert_called_once()
+    assert len(results) == 1
+    score, meta = results[0]
+    assert abs(score - 0.15) < 1e-6
+    assert meta.cam_id == "cam01"
+
+
+# ── QN-22  score_threshold defaults to 0.10 ──────────────────────────────
+
+@pytest.mark.unit
+def test_QN22_default_score_threshold_is_010():
+    """Default score_threshold must be 0.10 (appropriate for screen-capture EVA-CLIP scores)."""
+    from src.searcher import NLVideoSearcher
+    cfg = NLVideoSearcher._DEFAULT
+    assert cfg["search"]["score_threshold"] == 0.10, \
+        "Default score_threshold should be 0.10 for screen-capture EVA-CLIP scores"

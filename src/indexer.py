@@ -33,10 +33,40 @@ import numpy as np
 
 @dataclass
 class SegmentMeta:
-    video_id:   str
-    video_path: str
-    start_time: float
-    end_time:   float
+    # Identification
+    cam_id:             str      # camera/source ID; basename (no ext) for pre-recorded files
+    video_path:         str      # absolute path to segment file
+
+    # Position within the file (use for seeking / clip extraction)
+    relative_start:     float    # seconds from file start
+    relative_end:       float    # seconds from file start
+
+    # Wall-clock timestamps — 0.0 for pre-recorded files with no capture time
+    segment_wall_start: float = 0.0
+    absolute_start:     float = 0.0   # = segment_wall_start + relative_start
+    absolute_end:       float = 0.0   # = segment_wall_start + relative_end
+
+    def __post_init__(self) -> None:
+        # Auto-compute absolute timestamps when both are zero and wall_start is set
+        if self.absolute_start == 0.0 and self.absolute_end == 0.0:
+            self.absolute_start = self.segment_wall_start + self.relative_start
+            self.absolute_end   = self.segment_wall_start + self.relative_end
+
+
+def _migrate_segment_meta(meta: "SegmentMeta") -> "SegmentMeta":
+    """Upgrade a pre-v2.0 SegmentMeta (video_id/start_time/end_time) to v2.0 format."""
+    d = meta.__dict__
+    if "cam_id" in d:
+        return meta   # already v2.0 format
+    return SegmentMeta(
+        cam_id=d.get("video_id", ""),
+        video_path=d.get("video_path", ""),
+        relative_start=d.get("start_time", 0.0),
+        relative_end=d.get("end_time", 0.0),
+        segment_wall_start=0.0,
+        absolute_start=d.get("start_time", 0.0),
+        absolute_end=d.get("end_time", 0.0),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -93,22 +123,48 @@ class VideoIndex:
     # ------------------------------------------------------------------
 
     def save(self, index_dir: str) -> None:
-        """Serialise index + metadata to *index_dir*."""
+        """Serialise index + metadata to *index_dir* (atomic write)."""
         os.makedirs(index_dir, exist_ok=True)
 
         # When the index is on GPU, convert back to CPU before serialising.
-        # Use the public helper when available; fall back to writing as-is
-        # (which works for CPU-only faiss builds).
         if self._on_gpu and hasattr(faiss, "index_gpu_to_cpu"):
             cpu_index = faiss.index_gpu_to_cpu(self._index)
         else:
             cpu_index = self._index
-        faiss.write_index(cpu_index, os.path.join(index_dir, self.INDEX_FILE))
 
-        with open(os.path.join(index_dir, self.METADATA_FILE), "wb") as fh:
-            pickle.dump(self._meta, fh, protocol=pickle.HIGHEST_PROTOCOL)
+        # --- Atomic write: write to .tmp then rename so a crash mid-write
+        # never leaves a 0-byte / partial file in place. --------------------
+        idx_path  = os.path.join(index_dir, self.INDEX_FILE)
+        meta_path = os.path.join(index_dir, self.METADATA_FILE)
+
+        tmp_idx  = idx_path  + ".tmp"
+        tmp_meta = meta_path + ".tmp"
+        try:
+            faiss.write_index(cpu_index, tmp_idx)
+            with open(tmp_meta, "wb") as fh:
+                pickle.dump(self._meta, fh, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_idx,  idx_path)
+            os.replace(tmp_meta, meta_path)
+        except Exception:
+            # Clean up partial temp files on failure
+            for p in (tmp_idx, tmp_meta):
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+            raise
 
         print(f"[VideoIndex] Saved {self._index.ntotal} vectors → {index_dir}")
+
+    @classmethod
+    def load_or_create(
+        cls, index_dir: str, embed_dim: int, use_gpu: bool = True
+    ) -> "VideoIndex":
+        """Load an existing index from *index_dir*, or create a fresh empty one."""
+        try:
+            return cls.load(index_dir, use_gpu=use_gpu)
+        except FileNotFoundError:
+            return cls(embed_dim=embed_dim, use_gpu=use_gpu)
 
     @classmethod
     def load(cls, index_dir: str, use_gpu: bool = True) -> "VideoIndex":
@@ -121,8 +177,15 @@ class VideoIndex:
                 raise FileNotFoundError(f"Index file missing: {p}")
 
         cpu_index = faiss.read_index(idx_path)
-        with open(meta_path, "rb") as fh:
-            metadata: List[SegmentMeta] = pickle.load(fh)
+        try:
+            with open(meta_path, "rb") as fh:
+                metadata: List[SegmentMeta] = pickle.load(fh)
+        except (EOFError, pickle.UnpicklingError):
+            # Corrupted or empty metadata file — treat as empty index
+            metadata = []
+
+        # Migrate old-format SegmentMeta (pre-v2.0) that used video_id/start_time/end_time
+        metadata = [_migrate_segment_meta(m) for m in metadata]
 
         instance = cls.__new__(cls)
         instance.embed_dim = cpu_index.d
@@ -372,30 +435,24 @@ def calculate_iou(seg1: SegmentMeta, seg2: SegmentMeta) -> float:
     """
     Compute the Temporal Intersection over Union (T-IoU) between two segments.
 
-    Parameters
-    ----------
-    seg1, seg2 : SegmentMeta
-        Segment objects with ``start_time`` and ``end_time`` in seconds.
-
-    Returns
-    -------
-    float
-        IoU ∈ [0, 1].  Returns 0.0 for non-overlapping or adjacent segments.
+    Uses ``absolute_start`` / ``absolute_end`` so that cross-segment
+    deduplication works correctly for the continuous-streaming case
+    (where two overlapping files from the same camera contain the same event).
+    For pre-recorded files ``absolute_start == relative_start`` (wall_start=0),
+    so the behaviour is identical to the original implementation.
 
     Formula
     -------
-    Let s = start, e = end:
-
         intersection = max(0, min(e1,e2) - max(s1,s2))
         union        = max(e1,e2) - min(s1,s2)
         IoU          = intersection / union
     """
-    inter = max(0.0, min(seg1.end_time, seg2.end_time)
-                     - max(seg1.start_time, seg2.start_time))
+    inter = max(0.0, min(seg1.absolute_end, seg2.absolute_end)
+                     - max(seg1.absolute_start, seg2.absolute_start))
     if inter == 0.0:
         return 0.0
-    union = (max(seg1.end_time, seg2.end_time)
-             - min(seg1.start_time, seg2.start_time))
+    union = (max(seg1.absolute_end, seg2.absolute_end)
+             - min(seg1.absolute_start, seg2.absolute_start))
     return inter / union if union > 1e-9 else 0.0
 
 
@@ -443,7 +500,9 @@ def temporal_nms(
 
         duplicate = False
         for _, kept_meta in kept:
-            if kept_meta.video_id != meta.video_id:
+            # Only suppress across segments of the same camera/source.
+            # Different cameras may legitimately capture the same event.
+            if kept_meta.cam_id != meta.cam_id:
                 continue
             if calculate_iou(kept_meta, meta) > iou_threshold:
                 duplicate = True

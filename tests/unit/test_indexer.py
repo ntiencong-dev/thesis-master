@@ -60,10 +60,10 @@ pytestmark = pytest.mark.unit
 def _make_meta(n: int, vid: str = "v0", offset: float = 0.0) -> list[SegmentMeta]:
     return [
         SegmentMeta(
-            video_id=vid,
+            cam_id=vid,
             video_path=f"/fake/{vid}.mp4",
-            start_time=offset + i * 5.0,
-            end_time=offset + i * 5.0 + 5.0,
+            relative_start=offset + i * 5.0,
+            relative_end=offset + i * 5.0 + 5.0,
         )
         for i in range(n)
     ]
@@ -148,8 +148,8 @@ def test_IDX08_search_returns_correct_metadata():
     results = idx.search(vecs[2], top_k=1)
     assert results
     _, returned_meta = results[0]
-    # The exact match should be for the same start_time as meta[2]
-    assert returned_meta.start_time == metas[2].start_time
+    # The exact match should be for the same relative_start as meta[2]
+    assert returned_meta.relative_start == metas[2].relative_start
 
 
 # ── IDX-09..10  persistence ────────────────────────────────────────────────
@@ -164,9 +164,9 @@ def test_IDX09_save_load_round_trip(tmp_index_dir):
     # Metadata preserved
     loaded_metas = loaded._meta
     for orig, reloaded in zip(metas, loaded_metas):
-        assert orig.video_id    == reloaded.video_id
-        assert orig.start_time  == reloaded.start_time
-        assert orig.end_time    == reloaded.end_time
+        assert orig.cam_id         == reloaded.cam_id
+        assert orig.relative_start == reloaded.relative_start
+        assert orig.relative_end   == reloaded.relative_end
 
     # Search results preserved
     results = loaded.search(vecs[0], top_k=1)
@@ -211,10 +211,10 @@ def test_IDX12_multiple_adds():
 
 def _seg(vid: str, start: float, end: float, score: float) -> tuple:
     m = SegmentMeta(
-        video_id=vid,
+        cam_id=vid,
         video_path=f"/fake/{vid}.mp4",
-        start_time=start,
-        end_time=end,
+        relative_start=start,
+        relative_end=end,
     )
     return (score, m)
 
@@ -341,8 +341,8 @@ def test_NMS10_partial_overlap_below_threshold_both_kept():
 
 def _m(start: float, end: float, vid: str = "v") -> SegmentMeta:
     """Shorthand helper for IoU tests."""
-    return SegmentMeta(video_id=vid, video_path=f"/f/{vid}.mp4",
-                       start_time=start, end_time=end)
+    return SegmentMeta(cam_id=vid, video_path=f"/f/{vid}.mp4",
+                       relative_start=start, relative_end=end)
 
 
 # ── IOU-01  Non-overlapping → 0.0 ────────────────────────────────────────

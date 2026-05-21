@@ -79,27 +79,42 @@ def _normalize_query(query: str) -> str:
 
 @dataclass
 class SearchResult:
-    score:      float
-    video_id:   str
-    video_path: str
-    start_time: float
-    end_time:   float
-    rank:       int
+    score:          float
+    cam_id:         str        # camera/source ID (filename stem for pre-recorded)
+    video_path:     str
+    start_time:     float      # relative_start — seconds from file start (for seeking)
+    end_time:       float      # relative_end
+    rank:           int
+    absolute_start: float = 0.0   # wall-clock unix timestamp (0 for pre-recorded)
+    absolute_end:   float = 0.0
+
+    @property
+    def video_id(self) -> str:
+        """Backward-compatibility alias for cam_id."""
+        return self.cam_id
 
 class NLVideoSearcher:
     _DEFAULT: dict = {
         "backend": "pc",
         # Phase 1: default to EVA-CLIP ViT-L/14
         "engine":   {"type":"pc","model_name":"EVA02-L-14","pretrained":"merged2b_s4b_b131k","device":None,"batch_size":16,"frames_per_window":5},
-        "pipeline": {"video_backend":"opencv","window_sec":5.0,"overlap_ratio":0.50},
-        "index":    {"embed_dim":768,"index_dir":None},
-        "search":   {"top_k":5,"score_threshold":0.20,"nms_iou_threshold":0.30,
+        "pipeline": {"video_backend":"opencv","window_sec":10.0,"overlap_ratio":0.30},
+        "index":    {"embed_dim":768,"index_dir":None,"backend":"faiss"},
+        "search":   {"top_k":5,"score_threshold":0.10,"nms_iou_threshold":0.30,
                      "adaptive_threshold":True,"translate_vi":True},
     }
     def __init__(self, config=None):
         self._config = {**self._DEFAULT, **(config or {})}
         self._engine = create_engine(self._config)
         self._index  = VideoIndex(embed_dim=self._engine.embed_dim)
+
+        # Qdrant backend — initialized when index.backend == "qdrant"
+        self._qdrant_client     = None
+        self._qdrant_collection: Optional[str] = None
+        idx_cfg = self._config.get("index", {})
+        if idx_cfg.get("backend", "faiss").lower() == "qdrant":
+            self._init_qdrant(idx_cfg)
+
         p = self._config.get("pipeline", {}); e = self._config.get("engine", {})
         self._window_sec        = p.get("window_sec",       5.0)
         self._overlap_ratio     = p.get("overlap_ratio",    0.5)
@@ -116,13 +131,91 @@ class NLVideoSearcher:
         # Phase 3: optional BLIP-2 reranker (None by default)
         self._reranker = None
 
+    # ------------------------------------------------------------------
+    # Qdrant backend helpers
+    # ------------------------------------------------------------------
+
+    def _init_qdrant(self, idx_cfg: dict) -> None:
+        """
+        Connect to Qdrant and create the collection if it does not exist.
+        On connection failure the searcher falls back silently to Faiss.
+        """
+        url  = idx_cfg.get("qdrant_url",        "http://localhost:6333")
+        coll = idx_cfg.get("qdrant_collection", "nlvs_segments")
+        dim  = idx_cfg.get("embed_dim",         self._engine.embed_dim)
+        try:
+            from qdrant_client import QdrantClient
+            from qdrant_client.models import Distance, VectorParams
+            client = QdrantClient(url=url, timeout=10)
+            existing = {c.name for c in client.get_collections().collections}
+            if coll not in existing:
+                client.create_collection(
+                    collection_name=coll,
+                    vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+                )
+            self._qdrant_client     = client
+            self._qdrant_collection = coll
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning(
+                "[NLVideoSearcher] Qdrant unavailable (%s) — falling back to Faiss.", exc
+            )
+
+    def _search_qdrant(self, qvec: np.ndarray, top_k: int) -> list:
+        """Query Qdrant. Returns [(score, SegmentMeta), ...] sorted by score desc."""
+        response = self._qdrant_client.query_points(
+            collection_name=self._qdrant_collection,
+            query=qvec.tolist(),
+            limit=top_k,
+            with_payload=True,
+        )
+        hits = response.points
+        results = []
+        for hit in hits:
+            p = hit.payload or {}
+            meta = SegmentMeta(
+                cam_id=p.get("cam_id",             ""),
+                video_path=p.get("video_path",       ""),
+                relative_start=p.get("relative_start",  0.0),
+                relative_end=p.get("relative_end",    0.0),
+                segment_wall_start=p.get("segment_wall_start", 0.0),
+                absolute_start=p.get("absolute_start",   0.0),
+                absolute_end=p.get("absolute_end",     0.0),
+            )
+            results.append((float(hit.score), meta))
+        return results
+
+    def _store_window(self, emb_row: np.ndarray, meta: SegmentMeta) -> None:
+        """Persist one embedding+metadata to Qdrant (primary) or Faiss (fallback)."""
+        if self._qdrant_client is not None:
+            import uuid
+            from qdrant_client.models import PointStruct
+            self._qdrant_client.upsert(
+                collection_name=self._qdrant_collection,
+                points=[PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector=emb_row[0].tolist(),
+                    payload={
+                        "cam_id":             meta.cam_id,
+                        "video_path":         meta.video_path,
+                        "relative_start":     meta.relative_start,
+                        "relative_end":       meta.relative_end,
+                        "segment_wall_start": meta.segment_wall_start,
+                        "absolute_start":     meta.absolute_start,
+                        "absolute_end":       meta.absolute_end,
+                    },
+                )],
+            )
+        else:
+            self._index.add(emb_row, [meta])
+
     @classmethod
     def from_config(cls, path: str):
         with open(path) as f: return cls(yaml.safe_load(f))
 
     @classmethod
-    def from_params(cls, index_dir=None, use_sliding_window=True, window_sec=5.0,
-                    overlap_ratio=0.5, frames_per_window=5, device=None,
+    def from_params(cls, index_dir=None, use_sliding_window=True, window_sec=10.0,
+                    overlap_ratio=0.30, frames_per_window=5, device=None,
                     model_name="EVA02-L-14", pretrained="merged2b_s4b_b131k",
                     embed_dim=768):
         return cls({
@@ -131,15 +224,27 @@ class NLVideoSearcher:
                         "device":device,"batch_size":16,"frames_per_window":frames_per_window},
             "pipeline":{"video_backend":"opencv","window_sec":window_sec,
                         "overlap_ratio":overlap_ratio if use_sliding_window else 0.0},
-            "index":   {"embed_dim":embed_dim,"index_dir":index_dir},
-            "search":  {"top_k":5,"score_threshold":0.20,"nms_iou_threshold":0.30,
+            "index":   {"embed_dim":embed_dim,"index_dir":index_dir,"backend":"faiss"},
+            "search":  {"top_k":5,"score_threshold":0.10,"nms_iou_threshold":0.30,
                         "adaptive_threshold":True,"translate_vi":True},
         })
 
     def index_video(self, video_path: str, use_scene_detection: bool = False) -> int:
         print(f"[Searcher] Indexing: {video_path}")
-        vid_id = os.path.splitext(os.path.basename(video_path))[0]
+        cam_id = os.path.splitext(os.path.basename(video_path))[0]
         count  = 0
+
+        def _make_meta(t0: float, t1: float) -> SegmentMeta:
+            """Build a v2.0 SegmentMeta for a pre-recorded file (wall_start=0)."""
+            return SegmentMeta(
+                cam_id=cam_id,
+                video_path=video_path,
+                relative_start=t0,
+                relative_end=t1,
+                segment_wall_start=0.0,
+                absolute_start=t0,
+                absolute_end=t1,
+            )
 
         if use_scene_detection:
             from .scene_segmenter import SceneSegmenter
@@ -165,9 +270,7 @@ class NLVideoSearcher:
                 if not frames:
                     continue
                 emb  = self._engine.encode_segment_frames(frames)
-                meta = SegmentMeta(video_id=vid_id, video_path=video_path,
-                                   start_time=t0, end_time=t1)
-                self._index.add(emb.reshape(1, -1), [meta])
+                self._store_window(emb.reshape(1, -1), _make_meta(t0, t1))
                 count += 1
         else:
             stride = self._window_sec * (1.0 - self._overlap_ratio)
@@ -176,13 +279,14 @@ class NLVideoSearcher:
                                    backend=self._video_backend)
             for t0, t1, frames in pipe.iter_segments():
                 if not frames: continue
-                emb  = self._engine.encode_segment_frames(frames)
-                meta = SegmentMeta(video_id=vid_id, video_path=video_path, start_time=t0, end_time=t1)
-                self._index.add(emb.reshape(1, -1), [meta])
+                emb = self._engine.encode_segment_frames(frames)
+                self._store_window(emb.reshape(1, -1), _make_meta(t0, t1))
                 count += 1
 
-        print(f"[Searcher] +{count} segments | total={self._index.total_vectors()}")
-        if self.index_dir: self._index.save(self.index_dir)
+        backend_total = "qdrant" if self._qdrant_client is not None else self._index.total_vectors()
+        print(f"[Searcher] +{count} segments | backend_total={backend_total}")
+        if self.index_dir and self._qdrant_client is None:
+            self._index.save(self.index_dir)
         return count
 
     def index_directory(self, video_dir: str, extensions=(".mp4",".avi",".mov",".mkv")) -> int:
@@ -195,7 +299,7 @@ class NLVideoSearcher:
 
     def search(self, query_text: str, top_k=None, score_threshold=None, nms_iou=None,
                use_templates: bool = True, use_reranker: bool = False) -> List[SearchResult]:
-        if self._index.total_vectors() == 0:
+        if self._qdrant_client is None and self._index.total_vectors() == 0:
             raise RuntimeError("Index empty. Run index_video() first.")
         k   = top_k   if top_k   is not None else self._default_top_k
         iou = nms_iou if nms_iou is not None else self._nms_iou
@@ -211,7 +315,10 @@ class NLVideoSearcher:
         else:
             qvec = self._engine.encode_text(cleaned)
 
-        raw = self._index.search(qvec, top_k=k * 4)
+        if self._qdrant_client is not None:
+            raw = self._search_qdrant(qvec, top_k=k * 4)
+        else:
+            raw = self._index.search(qvec, top_k=k * 4)
 
         # Phase 1 §I2: adaptive threshold
         if score_threshold is not None:
@@ -225,8 +332,11 @@ class NLVideoSearcher:
 
         fil   = [(s, m) for s, m in raw if s >= thresh]
         dedup = temporal_nms(fil, iou_threshold=iou, top_k=k)
-        results = [SearchResult(score=sc, video_id=m.video_id, video_path=m.video_path,
-                                start_time=m.start_time, end_time=m.end_time, rank=i+1)
+        results = [SearchResult(score=sc, cam_id=m.cam_id, video_path=m.video_path,
+                                start_time=m.relative_start, end_time=m.relative_end,
+                                rank=i+1,
+                                absolute_start=m.absolute_start,
+                                absolute_end=m.absolute_end)
                    for i, (sc, m) in enumerate(dedup)]
 
         # Phase 3: two-stage retrieval via BLIP-2 reranker
@@ -235,11 +345,13 @@ class NLVideoSearcher:
             results = [
                 SearchResult(
                     score=r.score,
-                    video_id=r.video_id,
+                    cam_id=r.cam_id,
                     video_path=r.video_path,
                     start_time=r.start_time,
                     end_time=r.end_time,
                     rank=r.rank,
+                    absolute_start=r.absolute_start,
+                    absolute_end=r.absolute_end,
                 )
                 for r in reranked
             ]
@@ -343,7 +455,7 @@ class NLVideoSearcher:
         - raw Faiss scores before NMS and threshold filtering
         - comparison: template-ensemble vs raw query
         """
-        if self._index.total_vectors() == 0:
+        if self._qdrant_client is None and self._index.total_vectors() == 0:
             raise RuntimeError("Index empty.")
 
         cleaned    = _normalize_query(query_text)
@@ -353,11 +465,20 @@ class NLVideoSearcher:
         qvec_tmpl  = self._encode_with_templates(translated)
 
         def _top(vec, k):
-            rows = self._index.search(vec, top_k=k)
-            return [{"score": float(s), "video_id": m.video_id,
-                     "start": m.start_time, "end": m.end_time} for s, m in rows]
+            if self._qdrant_client is not None:
+                rows = self._search_qdrant(vec, top_k=k)
+            else:
+                rows = self._index.search(vec, top_k=k)
+            return [{"score": float(s), "cam_id": m.cam_id,
+                     "start": m.relative_start, "end": m.relative_end,
+                     "absolute_start": m.absolute_start} for s, m in rows]
 
-        raw_scores = [s for s, _ in self._index.search(qvec_tmpl, top_k=self._index.total_vectors())]
+        _all_k = 200 if self._qdrant_client is not None else self._index.total_vectors()
+        raw_scores = [s for s, _ in (
+            self._search_qdrant(qvec_tmpl, top_k=_all_k)
+            if self._qdrant_client is not None
+            else self._index.search(qvec_tmpl, top_k=_all_k)
+        )]
         adaptive_thresh = (
             self._compute_adaptive_threshold(raw_scores, self._score_threshold)
             if self._adaptive_threshold else self._score_threshold

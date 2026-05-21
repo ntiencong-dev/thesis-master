@@ -1,6 +1,7 @@
 # ============================================================
 # NLVS — Edge Deployment Configuration (AMD Kria KV260)
 # DPU B4096, Vitis AI 3.5, VVAS pipeline
+# Confirmed params: window=10s · overlap=30% · frames=5 · min_score=0.20
 # ============================================================
 
 backend: kria
@@ -11,12 +12,12 @@ engine:
   xmodel_text_path: /usr/share/vitis_ai_library/models/clip_vit_b16/clip_text.xmodel
   device_id: 0              # DPU device index
   batch_size: 4             # DPU B4096 optimal batch
-  frames_per_window: 5      # must match PC config for index portability
+  frames_per_window: 5      # confirmed — must match PC config for index portability
 
 pipeline:
   video_backend: gstreamer  # VVAS GStreamer plugins on Kria
-  window_sec: 5.0
-  overlap_ratio: 0.50
+  window_sec: 10.0          # confirmed — sliding-window duration
+  overlap_ratio: 0.30       # confirmed — 30% overlap → stride = 7.0 s
 
   # VVAS-specific GStreamer element overrides
   gst_source_element: "vvas_xmultisrc"       # hardware multi-source
@@ -24,13 +25,31 @@ pipeline:
   gst_scaler_element: "vvas_xfilter"         # FPGA multi-scaler (NV12→BGR)
 
 index:
-  embed_dim: 512            # INT8 DPU output still projected to 512-d fp32
+  embed_dim: 512            # INT8 DPU output projected to 512-d fp32
   index_dir: /opt/nlvs/index_store
+  backend: qdrant           # 'faiss' (dev) | 'qdrant' (production)
+  qdrant_url: http://localhost:6333
+  qdrant_collection: nlvs_segments
+
+capture:
+  storage_dirs:
+    - /storage/cam01
+    - /storage/cam02
+    - /storage/cam03
+  segment_sec: 60           # each file = 60s (tail-only overlap v2.0)
+  stride_sec: 50            # new segment starts every 50s
+
+job_queue:
+  db_path: /opt/nlvs/job_queue.db
+  max_retries: 3
+  processing_timeout: 300   # seconds before stuck job is reset to pending
+  circuit_breaker_open: 20  # queue depth threshold to stop accepting new jobs
+  circuit_breaker_close: 5  # queue depth threshold to resume accepting jobs
 
 search:
   top_k: 5
-  score_threshold: 0.20
-  nms_iou_threshold: 0.50
+  score_threshold: 0.20     # confirmed
+  nms_iou_threshold: 0.30   # temporal NMS
 
 api:
   host: 0.0.0.0
