@@ -43,13 +43,12 @@ from src.searcher import NLVideoSearcher, SearchResult
 
 app = FastAPI(
     title="NLVS — Natural Language Video Search",
-    description="Open-vocabulary video search powered by CLIP + Faiss.",
+    description="Open-vocabulary video search powered by CLIP + Qdrant.",
     version="1.0.0",
 )
 
 # Load config from environment variable; fall back to pc.yaml
 _CONFIG_PATH = os.environ.get("CONFIG", "config/pc.yaml")
-_INDEX_DIR   = os.environ.get("INDEX_DIR", "./index_store")
 
 # Lazy-initialise the searcher (model loading is expensive)
 _searcher: Optional[NLVideoSearcher] = None
@@ -61,12 +60,7 @@ def _get_searcher() -> NLVideoSearcher:
         if os.path.isfile(_CONFIG_PATH):
             _searcher = NLVideoSearcher.from_config(_CONFIG_PATH)
         else:
-            _searcher = NLVideoSearcher.from_params(index_dir=_INDEX_DIR)
-        # Try to restore a previously saved index
-        try:
-            _searcher.load_index()
-        except (FileNotFoundError, ValueError):
-            pass
+            _searcher = NLVideoSearcher.from_params()
     return _searcher
 
 

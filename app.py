@@ -65,7 +65,6 @@ _WINDOW_SEC          = 10.0
 _OVERLAP_RATIO       = 0.30
 _FRAMES_PER_WINDOW   = 5
 _SCORE_THRESHOLD     = 0.20
-_DEFAULT_INDEX_DIR   = os.path.join(os.path.dirname(__file__), "index_store")
 _DEFAULT_SEGMENT_DIR = os.path.join(os.path.dirname(__file__), "segments")
 _DEFAULT_DB_PATH     = os.path.join(_DEFAULT_SEGMENT_DIR, "job_queue.db")
 
@@ -175,8 +174,7 @@ def _make_indexer_config(segment_dir: str) -> dict:
     cfg["capture"]["storage_dirs"] = [segment_dir]
     if "index" not in cfg or cfg["index"] is None:
         cfg["index"] = {}
-    cfg["index"].setdefault("index_dir", _DEFAULT_INDEX_DIR)
-    # Note: backend is driven by pc.yaml — do NOT hardcode faiss here
+    # Note: backend is driven by pc.yaml — qdrant only
     cfg["index"].setdefault("embed_dim", 768)
     return cfg
 
@@ -339,8 +337,6 @@ def _pipeline_status() -> dict:
                     exact=False,
                 )
                 status["vectors_indexed"] = coll_info.count
-            elif indexer._faiss_index is not None:
-                status["vectors_indexed"] = indexer._faiss_index.total_vectors()
         except Exception:
             pass
     return status
@@ -357,7 +353,6 @@ def _load_searcher() -> NLVideoSearcher:
     if os.path.isfile(cfg_path):
         return NLVideoSearcher.from_config(cfg_path)
     return NLVideoSearcher.from_params(
-        index_dir=_DEFAULT_INDEX_DIR,
         window_sec=_WINDOW_SEC,
         overlap_ratio=_OVERLAP_RATIO,
         frames_per_window=_FRAMES_PER_WINDOW,
@@ -369,22 +364,17 @@ def _get_searcher() -> NLVideoSearcher:
 
 
 def _reset_searcher() -> None:
-    """Reset index state without destroying the cached model.
+    """Reset Qdrant connection without destroying the cached model.
 
-    Re-initialises Qdrant connection (useful after Qdrant restarts) and
-    clears Faiss in-memory vectors.  The heavy EVA-CLIP model stays cached
-    so there is no 25-second reload, and no Streamlit 1.32 ``expire_cache``
-    coroutine warning from calling ``.clear()``.
+    Re-initialises Qdrant connection (useful after Qdrant restarts).
+    The heavy EVA-CLIP model stays cached so there is no 25-second reload,
+    and no Streamlit 1.32 ``expire_cache`` coroutine warning.
     """
-    from src.indexer import VideoIndex  # local import to avoid circular at module level
-
     s = _load_searcher()
-    s._index = VideoIndex(embed_dim=s._engine.embed_dim)
     idx_cfg = s._config.get("index", {})
-    if idx_cfg.get("backend", "faiss").lower() == "qdrant":
-        s._qdrant_client = None
-        s._qdrant_collection = None
-        s._init_qdrant(idx_cfg)
+    s._qdrant_client = None
+    s._qdrant_collection = None
+    s._init_qdrant(idx_cfg)
     for k in ("_results", "_query", "_elapsed", "_norm_note"):
         st.session_state.pop(k, None)
 
@@ -430,19 +420,14 @@ with st.sidebar:
         )
         build_btn = st.button("Build Index", type="primary", use_container_width=True)
 
-    load_btn = st.button("🔄 Reload Index from Disk", use_container_width=True)
+    load_btn = st.button("🔄 Reconnect Qdrant", use_container_width=True)
     if load_btn:
-        _reset_searcher()
         try:
+            _reset_searcher()
             s = _get_searcher()
-            s.load_index(_DEFAULT_INDEX_DIR)
-            n = s._index.total_vectors()
-            if n > 0:
-                st.success(f"Loaded {n:,} vectors.")
-            else:
-                st.warning("Index empty.")
-        except FileNotFoundError:
-            st.error(f"No index at: {_DEFAULT_INDEX_DIR}")
+            info = s._qdrant_client.get_collection(s._qdrant_collection)
+            n = info.points_count
+            st.success(f"Qdrant reconnected. {n:,} vectors.")
         except Exception as exc:
             st.error(str(exc))
 
@@ -452,8 +437,8 @@ with st.sidebar:
 
 st.title("📹 Natural Language Video Search")
 st.caption(
-    "Powered by **EVA-CLIP ViT-L/14** + Faiss · NLVS v3.0 on AMD Kria KV260 (DPU B4096)  \n"
-    "window=10 s · overlap=30% · stride=7.0 s · min\_score=0.20"
+    "Powered by **EVA-CLIP ViT-L/14** + Qdrant · NLVS v3.0  \n"
+    "window=10 s · overlap=30% · stride=7.0 s · min\_score=0.10"
 )
 
 tab_camera, tab_search = st.tabs(["📷 Camera & Indexing", "🔍 Search"])
@@ -734,15 +719,10 @@ with tab_search:
     cam_ids: List[str] = []
 
     indexer_ref = st.session_state.get("indexer")
-    if indexer_ref is not None and indexer_ref._faiss_index is not None:
-        # Live indexer — use its in-memory Faiss index directly
-        n_vectors = indexer_ref._faiss_index.total_vectors()
-        cam_ids   = sorted({m.cam_id for m in indexer_ref._faiss_index._meta})
-    else:
-        try:
-            s = _get_searcher()
-            # Qdrant backend: count from Qdrant directly (Faiss _index is empty)
-            if s._qdrant_client is not None:
+    try:
+        s = _get_searcher()
+        # Qdrant backend: count from Qdrant directly
+        if s._qdrant_client is not None:
                 try:
                     col_info = s._qdrant_client.get_collection(s._qdrant_collection)
                     n_vectors = col_info.points_count or 0
@@ -760,11 +740,11 @@ with tab_search:
                     })
                 except Exception:
                     n_vectors = 0
-            else:
-                n_vectors = s._index.total_vectors()
-                cam_ids   = sorted({m.cam_id for m in s._index._meta})
-        except Exception:
-            pass
+        else:
+            n_vectors = 0
+            cam_ids   = []
+    except Exception:
+        pass
 
     if n_vectors > 0:
         cam_str = ", ".join(f"`{c}`" for c in cam_ids) if cam_ids else "unknown"
@@ -800,8 +780,11 @@ with tab_search:
                     (i + 1) / len(uploaded_files),
                     text=f"Indexed {uf.name}",
                 )
-            s.save_index(_DEFAULT_INDEX_DIR)
-            total = s._index.total_vectors()
+            try:
+                info = s._qdrant_client.get_collection(s._qdrant_collection)
+                total = info.points_count or 0
+            except Exception:
+                total = 0
             st.success(f"Index updated — {total:,} total vectors from {len(uploaded_files)} file(s).")
             st.rerun()
 
@@ -815,8 +798,6 @@ with tab_search:
 
     if search_btn and query:
         s = _get_searcher()
-        if indexer_ref is not None and indexer_ref._faiss_index is not None:
-            s._index = indexer_ref._faiss_index
 
         cleaned = _normalize_query(query)
         st.session_state["_norm_note"] = (

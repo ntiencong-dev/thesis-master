@@ -11,9 +11,9 @@ Scenarios covered
 SR-01  from_config(pc.yaml): loads without error, engine_type=pc
 SR-02  from_params(): correct window_sec, overlap, frames_per_window
 SR-03  index_video: returns segment count > 0
-SR-04  index_video: total_vectors() equals returned count
+SR-04  index_video: Qdrant vector count matches returned segment count
 SR-05  index_video: segment count matches sliding-window formula
-SR-06  search on empty index → RuntimeError
+SR-06  search with Qdrant unavailable → RuntimeError
 SR-07  search returns non-empty results for valid query
 SR-08  all result scores >= score_threshold
 SR-09  top_k is respected in returned result count
@@ -22,9 +22,9 @@ SR-11  result timestamps within video duration
 SR-12  no two results from same video overlap > nms_iou threshold
 SR-13  score_threshold=0.0 returns more results than default 0.20
 SR-14  score_threshold=0.99 returns empty list
-SR-15  save_index / load_index: post-reload search gives same top-1
-SR-16  save_index without index_dir → ValueError
-SR-17  load_index without index_dir → ValueError
+SR-15  (removed in v3.0 — Faiss save/load)
+SR-16  (removed in v3.0 — Faiss save/load)
+SR-17  (removed in v3.0 — Faiss save/load)
 SR-18  index_video on non-existent path → FileNotFoundError
 SR-19  SearchResult.rank is sequential (1, 2, 3, ...)
 SR-20  from_config: config path not found → FileNotFoundError
@@ -83,23 +83,31 @@ def test_SR02_from_params_config(real_video_path):
 # ── SR-03..05  index_video ────────────────────────────────────────────────
 
 def test_SR03_index_video_returns_positive(searcher_with_real_video, real_video_path):
-    # searcher_with_real_video already indexed real_video_path once
-    count = searcher_with_real_video._index.total_vectors()
+    # Check Qdrant vector count via the searcher's client
+    s = searcher_with_real_video
+    if s._qdrant_client is not None:
+        info = s._qdrant_client.get_collection(s._qdrant_collection)
+        count = info.points_count or 0
+    else:
+        pytest.skip("Qdrant not available")
     assert count > 0, "index_video must add at least one segment"
 
 
 def test_SR04_index_video_total_vectors(searcher_with_real_video):
-    total = searcher_with_real_video._index.total_vectors()
+    s = searcher_with_real_video
+    if s._qdrant_client is None:
+        pytest.skip("Qdrant not available")
+    info = s._qdrant_client.get_collection(s._qdrant_collection)
+    total = info.points_count or 0
     # fi003.mp4 is 76.07 s; window=5s, stride=2.5s → ~29 segments
     assert 25 <= total <= 45, f"Unexpected segment count: {total}"
 
 
-def test_SR05_sliding_window_count_formula(real_video_path, tmp_index_dir):
+def test_SR05_sliding_window_count_formula(real_video_path):
     import warnings; warnings.filterwarnings("ignore")
     from src.searcher import NLVideoSearcher
     import math
     s = NLVideoSearcher.from_params(
-        index_dir=tmp_index_dir,
         use_sliding_window=True,
         window_sec=5.0,
         overlap_ratio=0.5,
@@ -112,12 +120,14 @@ def test_SR05_sliding_window_count_formula(real_video_path, tmp_index_dir):
 
 # ── SR-06  empty index raises ─────────────────────────────────────────────
 
-def test_SR06_search_empty_index_raises():
+def test_SR06_search_empty_raises():
     import warnings; warnings.filterwarnings("ignore")
     from src.searcher import NLVideoSearcher
-    s = NLVideoSearcher.from_params()
-    with pytest.raises(RuntimeError, match="Index empty"):
-        s.search("test query")
+    from unittest.mock import patch
+    # Create a searcher but patch Qdrant to be unavailable after init
+    with patch("qdrant_client.QdrantClient", side_effect=Exception("refused")):
+        with pytest.raises(RuntimeError):
+            NLVideoSearcher.from_params()
 
 
 # ── SR-07..14  search behaviour ──────────────────────────────────────────
@@ -182,55 +192,10 @@ def test_SR14_high_threshold_empty(searcher_with_real_video):
     assert results == [], "score_threshold=0.99 should return no results"
 
 
-# ── SR-15  persistence round-trip ────────────────────────────────────────
+# ── SR-15..17 removed (Faiss save/load, v3.0) ────────────────────────────
+# SR-15, SR-16, SR-17 removed: save_index/load_index not present in Qdrant-only v3.0
 
-def test_SR15_save_load_round_trip(real_video_path, tmp_index_dir):
-    import warnings; warnings.filterwarnings("ignore")
-    from src.searcher import NLVideoSearcher
-
-    s1 = NLVideoSearcher.from_params(
-        index_dir=tmp_index_dir,
-        use_sliding_window=True,
-        window_sec=5.0,
-        overlap_ratio=0.5,
-        frames_per_window=2,
-    )
-    s1.index_video(real_video_path)
-    s1.save_index()
-
-    top1_before = s1.search("person", top_k=1, score_threshold=0.0)
-
-    s2 = NLVideoSearcher.from_params(
-        index_dir=tmp_index_dir,
-        use_sliding_window=True,
-        window_sec=5.0,
-        overlap_ratio=0.5,
-        frames_per_window=2,
-    )
-    s2.load_index()
-
-    assert s2._index.total_vectors() == s1._index.total_vectors()
-
-    top1_after = s2.search("person", top_k=1, score_threshold=0.0)
-    if top1_before and top1_after:
-        assert abs(top1_before[0].start_time - top1_after[0].start_time) < 1e-3
-
-
-# ── SR-16..18  error cases ────────────────────────────────────────────────
-
-def test_SR16_save_without_index_dir_raises():
-    from src.searcher import NLVideoSearcher
-    s = NLVideoSearcher.from_params(index_dir=None)
-    with pytest.raises(ValueError, match="index_dir"):
-        s.save_index()
-
-
-def test_SR17_load_without_index_dir_raises():
-    from src.searcher import NLVideoSearcher
-    s = NLVideoSearcher.from_params(index_dir=None)
-    with pytest.raises(ValueError, match="index_dir"):
-        s.load_index()
-
+# ── SR-18  error cases ────────────────────────────────────────────────────
 
 def test_SR18_index_video_missing_file():
     import warnings; warnings.filterwarnings("ignore")

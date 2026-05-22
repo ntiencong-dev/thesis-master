@@ -26,8 +26,7 @@ pipeline:
 
 index:
   embed_dim: 512            # INT8 DPU output projected to 512-d fp32
-  index_dir: /opt/nlvs/index_store
-  backend: qdrant           # 'faiss' (dev) | 'qdrant' (production)
+  backend: qdrant           # 'qdrant' (production)
   qdrant_url: http://localhost:6333
   qdrant_collection: nlvs_segments
 

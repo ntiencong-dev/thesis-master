@@ -1,16 +1,14 @@
 """
-continuous_indexer.py — Continuous Indexing Daemon v2.0
+continuous_indexer.py — Continuous Indexing Daemon v3.0
 
 Architecture ref: CONTINUOUS_STREAM_RESEARCH.md §4.1–§4.6
 
-Thread model (3 threads + main):
+Thread model (2 threads + main):
   1. watchdog  — inotify (watchdog lib) or polling: new .mp4 files → enqueue
-  2. indexer   — dequeue → encode → store in Qdrant/Faiss
-  3. persist   — periodic Faiss save to disk (Qdrant is persistent by design)
+  2. indexer   — dequeue → encode → store in Qdrant
 
-Vector store selection (CONTINUOUS_STREAM_RESEARCH.md §5):
-  - config["index"]["backend"] == "qdrant" → Qdrant on-disk HNSW
-  - anything else (or Qdrant connection failure) → Faiss VideoIndex fallback
+Vector store: Qdrant (sole backend since v3.0). Faiss fallback removed.
+If Qdrant is unavailable at startup, ContinuousIndexer raises RuntimeError.
 
 Startup recovery:
   ContinuousIndexer.__init__ calls queue.replay_from_storage() with
@@ -55,12 +53,11 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Internal imports
 # ---------------------------------------------------------------------------
-from .indexer import SegmentMeta, VideoIndex
+from .indexer import SegmentMeta
 from .job_queue import CircuitBreaker, IndexJob, PersistentJobQueue
 from .engines.factory import create_engine
 
 _DEFAULT_DB_PATH    = "/opt/nlvs/job_queue.db"
-_PERSIST_INTERVAL   = 300    # seconds between Faiss index saves
 _POLL_INTERVAL      = 5.0    # seconds between polling cycles (fallback watchdog)
 _DEQUEUE_SLEEP      = 2.0    # seconds to sleep when queue is empty
 
@@ -93,7 +90,6 @@ class ContinuousIndexer:
         # --- Vector store ---
         self._qdrant_client     = None
         self._qdrant_collection = None
-        self._faiss_index: Optional[VideoIndex] = None
         self._init_vector_store()
 
         # --- Startup recovery ---
@@ -111,9 +107,6 @@ class ContinuousIndexer:
         self._thread_indexer  = threading.Thread(
             target=self._indexer_loop, name="CI-Indexer", daemon=True
         )
-        self._thread_persist  = threading.Thread(
-            target=self._persist_loop, name="CI-Persist", daemon=True
-        )
 
         logger.info("[ContinuousIndexer] Initialized.")
 
@@ -126,17 +119,13 @@ class ContinuousIndexer:
         self._stop.clear()
         self._thread_watchdog.start()
         self._thread_indexer.start()
-        self._thread_persist.start()
         logger.info("[ContinuousIndexer] All threads started.")
 
     def stop(self, timeout: float = 15.0) -> None:
         """Signal all threads to stop and wait for them."""
         self._stop.set()
-        for t in (self._thread_watchdog, self._thread_indexer, self._thread_persist):
+        for t in (self._thread_watchdog, self._thread_indexer):
             t.join(timeout=timeout)
-        # Flush Faiss index one last time
-        if self._faiss_index is not None:
-            self._save_faiss()
         self._queue.close()
         logger.info("[ContinuousIndexer] Stopped.")
 
@@ -146,48 +135,36 @@ class ContinuousIndexer:
 
     def _init_vector_store(self) -> None:
         """
-        Try Qdrant first; fall back to Faiss if unavailable or not configured.
+        Connect to Qdrant and create the collection if absent.
+        Raises RuntimeError if Qdrant is unavailable (no Faiss fallback).
         """
-        idx_cfg   = self._config.get("index", {})
-        backend   = idx_cfg.get("backend", "faiss").lower()
-        embed_dim = idx_cfg.get("embed_dim", 768)
-        index_dir = idx_cfg.get("index_dir", "./index_store")
+        idx_cfg         = self._config.get("index", {})
+        embed_dim       = idx_cfg.get("embed_dim", 768)
+        qdrant_url      = idx_cfg.get("qdrant_url",        "http://localhost:6333")
+        collection_name = idx_cfg.get("qdrant_collection", "nlvs_segments")
+        try:
+            from qdrant_client import QdrantClient
+            from qdrant_client.models import Distance, VectorParams
 
-        if backend == "qdrant":
-            qdrant_url        = idx_cfg.get("qdrant_url", "http://localhost:6333")
-            collection_name   = idx_cfg.get("qdrant_collection", "nlvs_segments")
-            try:
-                from qdrant_client import QdrantClient
-                from qdrant_client.models import Distance, VectorParams
-
-                client = QdrantClient(url=qdrant_url, timeout=10)
-                # Create collection if it does not exist
-                existing = {c.name for c in client.get_collections().collections}
-                if collection_name not in existing:
-                    client.create_collection(
-                        collection_name=collection_name,
-                        vectors_config=VectorParams(size=embed_dim, distance=Distance.COSINE),
-                    )
-                    logger.info("[ContinuousIndexer] Created Qdrant collection '%s'.", collection_name)
-                else:
-                    logger.info("[ContinuousIndexer] Using existing Qdrant collection '%s'.", collection_name)
-
-                self._qdrant_client     = client
-                self._qdrant_collection = collection_name
-                logger.info("[ContinuousIndexer] Qdrant backend ready at %s.", qdrant_url)
-                return
-            except Exception as exc:
-                logger.warning(
-                    "[ContinuousIndexer] Qdrant unavailable (%s). Falling back to Faiss.", exc
+            client = QdrantClient(url=qdrant_url, timeout=10)
+            existing = {c.name for c in client.get_collections().collections}
+            if collection_name not in existing:
+                client.create_collection(
+                    collection_name=collection_name,
+                    vectors_config=VectorParams(size=embed_dim, distance=Distance.COSINE),
                 )
+                logger.info("[ContinuousIndexer] Created Qdrant collection '%s'.", collection_name)
+            else:
+                logger.info("[ContinuousIndexer] Using existing Qdrant collection '%s'.", collection_name)
 
-        # Faiss fallback
-        self._faiss_index = VideoIndex.load_or_create(
-            index_dir=index_dir,
-            embed_dim=embed_dim,
-            use_gpu=False,   # background daemon — don't monopolise GPU
-        )
-        logger.info("[ContinuousIndexer] Faiss backend ready. index_dir=%s", index_dir)
+            self._qdrant_client     = client
+            self._qdrant_collection = collection_name
+            logger.info("[ContinuousIndexer] Qdrant backend ready at %s.", qdrant_url)
+        except Exception as exc:
+            raise RuntimeError(
+                f"[ContinuousIndexer] Qdrant unavailable at {qdrant_url}: {exc}. "
+                "Start Qdrant before launching ContinuousIndexer."
+            ) from exc
 
     # ------------------------------------------------------------------
     # Watchdog thread
@@ -342,50 +319,28 @@ class ContinuousIndexer:
         logger.info("[CI-Indexer] %s → %d windows indexed.", Path(seg_path).name, count)
 
     def _store_vector(self, embedding, meta: SegmentMeta) -> None:
-        """Store a single embedding+meta in Qdrant or Faiss."""
+        """Store a single embedding+meta in Qdrant."""
         import numpy as np
         vec = embedding.astype(np.float32).reshape(1, -1)
 
-        if self._qdrant_client is not None:
-            from qdrant_client.models import PointStruct
-            import uuid
-            point = PointStruct(
-                id=str(uuid.uuid4()),
-                vector=vec[0].tolist(),
-                payload={
-                    "cam_id":             meta.cam_id,
-                    "video_path":         meta.video_path,
-                    "relative_start":     meta.relative_start,
-                    "relative_end":       meta.relative_end,
-                    "segment_wall_start": meta.segment_wall_start,
-                    "absolute_start":     meta.absolute_start,
-                    "absolute_end":       meta.absolute_end,
-                },
-            )
-            self._qdrant_client.upsert(
-                collection_name=self._qdrant_collection,
-                points=[point],
-            )
-        elif self._faiss_index is not None:
-            self._faiss_index.add(vec, [meta])
+        from qdrant_client.models import PointStruct
+        import uuid
+        point = PointStruct(
+            id=str(uuid.uuid4()),
+            vector=vec[0].tolist(),
+            payload={
+                "cam_id":             meta.cam_id,
+                "video_path":         meta.video_path,
+                "relative_start":     meta.relative_start,
+                "relative_end":       meta.relative_end,
+                "segment_wall_start": meta.segment_wall_start,
+                "absolute_start":     meta.absolute_start,
+                "absolute_end":       meta.absolute_end,
+            },
+        )
+        self._qdrant_client.upsert(
+            collection_name=self._qdrant_collection,
+            points=[point],
+        )
 
-    # ------------------------------------------------------------------
-    # Persist thread (Faiss only)
-    # ------------------------------------------------------------------
 
-    def _persist_loop(self) -> None:
-        """Periodically flush Faiss index to disk."""
-        logger.info("[CI-Persist] Started (interval=%ds).", _PERSIST_INTERVAL)
-        while not self._stop.is_set():
-            self._stop.wait(timeout=_PERSIST_INTERVAL)
-            if self._faiss_index is not None:
-                self._save_faiss()
-        logger.info("[CI-Persist] Stopped.")
-
-    def _save_faiss(self) -> None:
-        idx_dir = (self._config.get("index") or {}).get("index_dir", "./index_store")
-        try:
-            self._faiss_index.save(idx_dir)
-            logger.info("[CI-Persist] Faiss index saved to %s.", idx_dir)
-        except Exception as exc:
-            logger.error("[CI-Persist] Faiss save failed: %s", exc)

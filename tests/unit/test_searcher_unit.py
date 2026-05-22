@@ -143,9 +143,10 @@ def test_QN14_from_params_still_works():
     from src.searcher import NLVideoSearcher
     sig = inspect.signature(NLVideoSearcher.from_params)
     params = list(sig.parameters.keys())
-    # Required params must still be present
-    assert "index_dir" in params
+    # Required params must still be present; index_dir removed in v3.0
     assert "window_sec" in params
+    assert "qdrant_url" in params
+    assert "index_dir" not in params
 
 
 # ── QN-15  search() Phase 3 signature ────────────────────────────────────
@@ -228,11 +229,11 @@ def test_QN19_init_qdrant_sets_client_when_reachable():
     assert searcher._qdrant_collection == "nlvs_segments"
 
 
-# ── QN-20  _init_qdrant leaves client None when Qdrant is unreachable ────
+# ── QN-20  _init_qdrant raises RuntimeError when Qdrant is unreachable ────
 
 @pytest.mark.unit
-def test_QN20_init_qdrant_fallback_when_unreachable():
-    """_init_qdrant() must leave _qdrant_client as None on connection error."""
+def test_QN20_init_qdrant_raises_when_unreachable():
+    """_init_qdrant() must raise RuntimeError on connection error (v3.0 behavior)."""
     from unittest.mock import MagicMock, patch
     from src.searcher import NLVideoSearcher
 
@@ -242,13 +243,12 @@ def test_QN20_init_qdrant_fallback_when_unreachable():
         searcher._qdrant_collection = None
         searcher._engine = MagicMock()
         searcher._engine.embed_dim = 768
-        NLVideoSearcher._init_qdrant(searcher, {
-            "qdrant_url": "http://localhost:6333",
-            "qdrant_collection": "nlvs_segments",
-            "embed_dim": 768,
-        })
-
-    assert searcher._qdrant_client is None
+        with pytest.raises(RuntimeError, match="Qdrant unavailable"):
+            NLVideoSearcher._init_qdrant(searcher, {
+                "qdrant_url": "http://localhost:6333",
+                "qdrant_collection": "nlvs_segments",
+                "embed_dim": 768,
+            })
 
 
 # ── QN-21  _search_qdrant uses query_points (qdrant-client ≥1.7) ─────────

@@ -97,29 +97,6 @@ def clip_engine():
 
 
 @pytest.fixture(scope="session")
-def video_index_with_data():
-    """
-    A VideoIndex pre-populated with 10 synthetic unit vectors.
-    Shared across all tests in the session.
-    """
-    from src.indexer import VideoIndex, SegmentMeta
-
-    idx = VideoIndex(embed_dim=EMBED_DIM, use_gpu=False)
-    vecs = make_random_unit_vectors(10)
-    metas = [
-        SegmentMeta(
-            video_id=f"vid{i}",
-            video_path=f"/fake/vid{i}.mp4",
-            start_time=float(i * 5),
-            end_time=float(i * 5 + 5),
-        )
-        for i in range(10)
-    ]
-    idx.add(vecs, metas)
-    return idx, vecs, metas
-
-
-@pytest.fixture(scope="session")
 def searcher_with_real_video(real_video_path, tmp_path_factory):
     """
     NLVideoSearcher with the real video already indexed.

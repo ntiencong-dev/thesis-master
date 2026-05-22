@@ -23,7 +23,6 @@ pipeline:
 
 index:
   embed_dim: 768            # EVA-CLIP ViT-L/14 embedding dimension
-  index_dir: ./index_store  # Faiss fallback path (used when Qdrant is unreachable)
   backend: qdrant           # unified with Kria — same workflow on both platforms
   qdrant_url: http://localhost:6333
   qdrant_collection: nlvs_segments
