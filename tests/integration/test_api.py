@@ -147,16 +147,20 @@ def test_API06_index_directory_missing(client):
 
 def test_API07_search_empty_index_returns_409():
     """
-    Create a brand-new client with an empty index and verify 409.
+    Create a brand-new client backed by a fresh empty Qdrant collection and
+    verify POST /search returns 409 (no vectors indexed yet).
     """
     import api.main as app_module
     original = app_module._searcher
     app_module._searcher = None
 
-    # Create a searcher with empty index
+    # Use a dedicated empty collection so this test is isolated from real data.
+    # from_params() creates the collection if it does not exist (0 vectors).
     from src.searcher import NLVideoSearcher
-    app_module._searcher = NLVideoSearcher.from_params(index_dir=None)
-    # index is empty (0 vectors)
+    app_module._searcher = NLVideoSearcher.from_params(
+        qdrant_collection="nlvs_segments_api07_empty"
+    )
+    # collection was just created → 0 vectors → search must return 409
 
     with TestClient(app_module.app) as c:
         resp = c.post("/search", json={"query": "test"})

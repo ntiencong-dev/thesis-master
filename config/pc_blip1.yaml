@@ -1,0 +1,55 @@
+# ============================================================
+# NLVS — PC / BLIP-1 Configuration (GTX 1650 Ti, CUDA)
+# BLIP-1 ITC+ITM pipeline for Kria KV260 feasibility testing.
+#
+# Key differences from pc.yaml:
+#   * engine.type: blip1  (BLIP-1 ViT-B/16, not EVA-CLIP ViT-L/14)
+#   * embed_dim: 256       (BLIP-1 ITC head, not 768)
+#   * qdrant_collection: nlvs_segments_blip1  (NEW — not interchangeable with nlvs_segments)
+#   * use_itm_reranker: true  (stage-2 BLIP-1 ITM reranking, ~2.3 s on ARM)
+#
+# Migration note:
+#   Re-index all segments after switching to this config:
+#     CONFIG=config/pc_blip1.yaml python index_video.py --dir ./segments
+# ============================================================
+
+backend: pc
+
+engine:
+  type: blip1
+  model_name: Salesforce/blip-itm-base-coco
+  device: cuda              # auto-falls-back to 'cpu' if no CUDA
+  batch_size: 16
+  frames_per_window: 5
+
+pipeline:
+  video_backend: opencv
+  window_sec: 10.0
+  overlap_ratio: 0.30
+
+index:
+  embed_dim: 256            # BLIP-1 ITC projection dim (ViT-B/16 → 768 → 256)
+  backend: qdrant
+  qdrant_url: http://localhost:6333
+  qdrant_collection: nlvs_segments_blip1   # separate from EVA-CLIP collection
+
+capture:
+  storage_dirs:
+    - ./segments
+  segment_sec: 60
+  stride_sec: 50
+
+job_queue:
+  db_path: ./segments/job_queue.db
+
+search:
+  top_k: 5
+  score_threshold: 0.20     # BLIP-1 ITC cosine scores typically 0.30-0.60
+  nms_iou_threshold: 0.30
+  use_itm_reranker: true    # enable stage-2 ITM cross-encoder reranking
+  itm_top_k: 50             # candidates to pass to BLIP-1 ITM reranker
+  itm_alpha: 0.6            # combined = 0.6 * cosine + 0.4 * itm_prob
+
+api:
+  host: 0.0.0.0
+  port: 8000

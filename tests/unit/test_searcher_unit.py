@@ -20,6 +20,7 @@ QN-11  "locate <X>" stripped
 QN-12  "can you find <X>" stripped
 QN-21  _search_qdrant uses query_points() not search() (qdrant-client ≥1.7)
 QN-22  Default score_threshold is 0.10 (lowered for screen-capture EVA-CLIP)
+QN-23  _init_qdrant raises RuntimeError when existing collection has wrong dim
 """
 
 from __future__ import annotations
@@ -297,3 +298,41 @@ def test_QN22_default_score_threshold_is_010():
     cfg = NLVideoSearcher._DEFAULT
     assert cfg["search"]["score_threshold"] == 0.10, \
         "Default score_threshold should be 0.10 for screen-capture EVA-CLIP scores"
+
+
+# ── QN-23  _init_qdrant raises on dim mismatch ────────────────────────────
+
+@pytest.mark.unit
+def test_QN23_init_qdrant_raises_on_dim_mismatch():
+    """_init_qdrant must raise RuntimeError if collection has wrong embed_dim."""
+    from unittest.mock import MagicMock, patch
+    from src.searcher import NLVideoSearcher
+
+    # Build a minimal searcher (no model load)
+    s = object.__new__(NLVideoSearcher)
+    s._engine = MagicMock()
+    s._engine.embed_dim = 768
+
+    # Fake collection list entry: must set .name as a plain attribute (NOT via
+    # MagicMock(name=...) which sets the mock's debug name, not the attribute).
+    fake_coll_entry = MagicMock()
+    fake_coll_entry.name = "nlvs_segments"
+
+    # Fake collection info: existing dim = 512
+    mock_collection_info = MagicMock()
+    mock_collection_info.config.params.vectors.size = 512
+    # Ensure hasattr(vectors_cfg, "size") returns True
+    type(mock_collection_info.config.params.vectors).size = \
+        MagicMock(return_value=512, __get__=lambda self, obj, cls: 512)
+
+    mock_client = MagicMock()
+    mock_client.get_collections.return_value.collections = [fake_coll_entry]
+    mock_client.get_collection.return_value = mock_collection_info
+
+    with patch("qdrant_client.QdrantClient", return_value=mock_client):
+        with pytest.raises(RuntimeError, match="dim=512"):
+            s._init_qdrant({
+                "qdrant_url": "http://localhost:6333",
+                "qdrant_collection": "nlvs_segments",
+                "embed_dim": 768,
+            })

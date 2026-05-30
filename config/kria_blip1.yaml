@@ -1,0 +1,62 @@
+# ============================================================
+# NLVS — Kria KV260 / BLIP-1 Configuration (AMD Kria KV260)
+# BLIP-1 ITC+ITM deployment target for master's thesis.
+#
+# Kria deployment status (as of 2026-05-30):
+#   * BLIP-1 ViT-B/16 visual encoder: needs .xmodel from Vitis AI PTQ
+#   * BERT text encoder + ITM cross-attention: ARM Cortex-A53 CPU
+#
+# Blocker: .xmodel file for BLIP-1 ViT-B/16 not yet compiled.
+# Use engine.type: pc with device: cpu on Kria for pipeline validation
+# until the .xmodel is ready.
+#
+# DPU latency estimates (B4096, INT8):
+#   ViT-B/16 visual encode : ~12 ms/frame
+#   BERT ITC text encode   : ~20 ms/query  (ARM)
+#   ITM cross-attention    : ~34 ms/cand   (ARM)
+#   Stage-2 (50 cands)     : ~2.3 s total  (acceptable)
+# ============================================================
+
+backend: kria
+
+engine:
+  type: kria                # KriaEngine → DPU B4096 via VART/XIR
+  # BLIP-1 ViT-B/16 xmodel paths (to be compiled with Vitis AI 3.5)
+  xmodel_path:      /usr/share/vitis_ai_library/models/blip1_vit_b16/blip1_vision.xmodel
+  xmodel_text_path: /usr/share/vitis_ai_library/models/blip1_vit_b16/blip1_text.xmodel
+  embed_dim: 256            # BLIP-1 ITC projection dim
+  batch_size: 4             # DPU B4096 optimal batch
+  frames_per_window: 5
+  device: cpu               # text encoder runs on ARM CPU
+
+pipeline:
+  video_backend: opencv     # VVAS fallback until GStreamer plugins validated
+  window_sec: 10.0
+  overlap_ratio: 0.30
+
+index:
+  embed_dim: 256
+  backend: qdrant
+  qdrant_url: http://localhost:6333
+  qdrant_collection: nlvs_segments_kria_blip1  # Kria-specific collection (256-dim)
+
+capture:
+  storage_dirs:
+    - ./segments
+  segment_sec: 60
+  stride_sec: 50
+
+job_queue:
+  db_path: ./segments/job_queue.db
+
+search:
+  top_k: 5
+  score_threshold: 0.20
+  nms_iou_threshold: 0.30
+  use_itm_reranker: true
+  itm_top_k: 50
+  itm_alpha: 0.6
+
+api:
+  host: 0.0.0.0
+  port: 8000

@@ -136,6 +136,7 @@ class NLVideoSearcher:
         """
         Connect to Qdrant and create the collection if it does not exist.
         Raises RuntimeError if Qdrant is unavailable (no Faiss fallback).
+        Raises RuntimeError if the collection exists with the wrong embed_dim.
         """
         url  = idx_cfg.get("qdrant_url",        "http://localhost:6333")
         coll = idx_cfg.get("qdrant_collection", "nlvs_segments")
@@ -150,8 +151,25 @@ class NLVideoSearcher:
                     collection_name=coll,
                     vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
                 )
+            else:
+                # Validate that the existing collection has the expected dimension.
+                info        = client.get_collection(coll)
+                vectors_cfg = info.config.params.vectors
+                existing_dim = (
+                    vectors_cfg.size
+                    if hasattr(vectors_cfg, "size")
+                    else next(iter(vectors_cfg.values())).size
+                )
+                if existing_dim != dim:
+                    raise RuntimeError(
+                        f"[NLVideoSearcher] Qdrant collection '{coll}' has dim={existing_dim} "
+                        f"but engine requires dim={dim}. "
+                        f"Delete the collection or use a different qdrant_collection name."
+                    )
             self._qdrant_client     = client
             self._qdrant_collection = coll
+        except RuntimeError:
+            raise
         except Exception as exc:
             raise RuntimeError(
                 f"[NLVideoSearcher] Qdrant unavailable at {url}: {exc}. "
@@ -160,6 +178,11 @@ class NLVideoSearcher:
 
     def _search_qdrant(self, qvec: np.ndarray, top_k: int) -> list:
         """Query Qdrant. Returns [(score, SegmentMeta), ...] sorted by score desc."""
+        # encode_text returns (N, D); squeeze to 1-D so Qdrant doesn't treat it
+        # as a multi-vector query and raise "Conversion between multi and regular
+        # vectors failed".
+        if qvec.ndim > 1:
+            qvec = qvec[0]
         response = self._qdrant_client.query_points(
             collection_name=self._qdrant_collection,
             query=qvec.tolist(),
@@ -334,19 +357,19 @@ class NLVideoSearcher:
                                 absolute_end=m.absolute_end)
                    for i, (sc, m) in enumerate(dedup)]
 
-        # Phase 3: two-stage retrieval via BLIP-2 reranker
+        # Phase 3: two-stage retrieval via reranker (BLIP-2 or BLIP-1 ITM)
         if use_reranker and self._reranker is not None:
             reranked = self._reranker.rerank(results, cleaned, top_k=k)
             results = [
                 SearchResult(
                     score=r.score,
-                    cam_id=r.cam_id,
+                    cam_id=r.video_id,          # RerankResult uses video_id
                     video_path=r.video_path,
                     start_time=r.start_time,
                     end_time=r.end_time,
                     rank=r.rank,
-                    absolute_start=r.absolute_start,
-                    absolute_end=r.absolute_end,
+                    absolute_start=getattr(r, "absolute_start", 0.0),
+                    absolute_end=getattr(r, "absolute_end", 0.0),
                 )
                 for r in reranked
             ]

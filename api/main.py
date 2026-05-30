@@ -64,6 +64,17 @@ def _get_searcher() -> NLVideoSearcher:
     return _searcher
 
 
+def _qdrant_total(searcher: NLVideoSearcher) -> int:
+    """Return number of vectors in the Qdrant collection (0 if unavailable)."""
+    try:
+        if searcher._qdrant_client is None:
+            return 0
+        info = searcher._qdrant_client.get_collection(searcher._qdrant_collection)
+        return info.points_count or 0
+    except Exception:
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
@@ -149,7 +160,7 @@ def health():
     return HealthResponse(
         status="ok",
         backend=backend,
-        total_vectors=searcher._index.total_vectors(),
+        total_vectors=_qdrant_total(searcher),
         config_path=_CONFIG_PATH,
     )
 
@@ -178,7 +189,7 @@ def index_video(req: IndexRequest):
     return IndexResponse(
         video_path=req.video_path,
         segments_added=n,
-        total_in_index=searcher._index.total_vectors(),
+        total_in_index=_qdrant_total(searcher),
     )
 
 
@@ -200,7 +211,7 @@ def index_directory(req: IndexDirRequest):
     return IndexResponse(
         video_path=req.video_dir,
         segments_added=n,
-        total_in_index=searcher._index.total_vectors(),
+        total_in_index=_qdrant_total(searcher),
     )
 
 
@@ -219,7 +230,7 @@ def search(req: SearchRequest):
     Example query: "người leo rào" / "red truck passing the gate"
     """
     searcher = _get_searcher()
-    if searcher._index.total_vectors() == 0:
+    if _qdrant_total(searcher) == 0:
         raise HTTPException(
             status_code=409,
             detail="Index is empty. POST /index first.",
@@ -345,7 +356,7 @@ def debug_query(
     Useful for debugging why a query returns unexpected results.
     """
     searcher = _get_searcher()
-    if searcher._index.total_vectors() == 0:
+    if _qdrant_total(searcher) == 0:
         raise HTTPException(status_code=409, detail="Index is empty.")
     try:
         return searcher.search_debug(query, top_k=top_k, score_threshold=0.0)

@@ -29,6 +29,22 @@ ENG-20  XCLIPEngine._sample_or_pad: fewer frames → padded to n
 ENG-21  XCLIPEngine._sample_or_pad: more frames → sub-sampled to n
 ENG-22  XCLIPEngine._sample_or_pad: empty input → n blank frames
 ENG-23  XCLIPEngine._sample_or_pad: exact n frames → unchanged
+ENG-24  factory.create_engine type='languagebind' → ImportError acceptable
+ENG-25  factory.create_engine type='internvideo2' → ImportError acceptable
+ENG-26  LanguageBindEngine module importable, EMBED_DIM_VALUE=768
+ENG-27  InternVideo2Engine module importable, EMBED_DIM_VALUE=768
+ENG-28  LanguageBindEngine._sample_or_pad: fewer frames → padded to n
+ENG-29  LanguageBindEngine._sample_or_pad: more frames → sub-sampled to n
+ENG-30  InternVideo2Engine._sample_or_pad: empty → n blank frames
+BLIP-1 engine (unit — all mock-based, no model download)
+ENG-31  BLIP1Engine module importable; BLIP1_AVAILABLE flag; issubclass check
+ENG-32  factory.create_engine type='blip1' → no ValueError (ImportError OK)
+ENG-33  factory.create_engine unknown type error message includes 'blip1'
+ENG-34  BLIP1Engine.embed_dim == 256 (mock)
+ENG-35  BLIP1Engine.encode_frames(): shape (N,256) float32 L2-norm (mock)
+ENG-36  BLIP1Engine.encode_text(): shape (N,256) float32 L2-norm (mock)
+ENG-37  BLIP1Engine.score_itm(): shape (N,) float32 in [0,1] (mock)
+ENG-38  BLIP1Engine.encode_frames(): empty input → (0, 256) (mock)
 """
 
 from __future__ import annotations
@@ -330,3 +346,179 @@ def test_ENG30_internvideo2_sample_or_pad_empty():
     result = InternVideo2Engine._sample_or_pad([], 8)
     assert len(result) == 8
     assert all(arr.shape == (224, 224, 3) for arr in result)
+
+
+# ── ENG-31..38  BLIP-1 engine (all unit — mock-based, no model download) ──
+
+def _make_blip1_engine_mock():
+    """Return a BLIP1Engine with model loading completely bypassed."""
+    from src.engines.blip1_engine import BLIP1Engine, BLIP1_AVAILABLE
+    if not BLIP1_AVAILABLE:
+        pytest.skip("transformers not installed — BLIP1Engine unavailable")
+    import torch
+    from unittest.mock import MagicMock
+    engine = object.__new__(BLIP1Engine)
+    engine._model_name = "Salesforce/blip-itm-base-coco"
+    engine._batch_size = 4
+    engine._device     = torch.device("cpu")
+    engine._processor  = MagicMock()
+    engine._model      = MagicMock()
+    return engine
+
+
+@pytest.mark.unit
+def test_ENG31_blip1_engine_module_importable():
+    """BLIP1Engine must be importable; BLIP1_AVAILABLE flag must exist."""
+    from src.engines.blip1_engine import BLIP1Engine, BLIP1_AVAILABLE
+    from src.engines.base_engine import InferenceEngine
+    assert issubclass(BLIP1Engine, InferenceEngine)
+    assert BLIP1Engine.EMBED_DIM_VALUE == 256
+    assert isinstance(BLIP1_AVAILABLE, bool)
+
+
+@pytest.mark.unit
+def test_ENG32_factory_blip1_type_accepted():
+    """factory.create_engine type='blip1' must NOT raise ValueError."""
+    from src.engines.factory import create_engine
+    cfg = {"engine": {"type": "blip1", "model_name": "Salesforce/blip-itm-base-coco"}}
+    try:
+        engine = create_engine(cfg)
+        from src.engines.blip1_engine import BLIP1Engine
+        assert isinstance(engine, BLIP1Engine)
+    except ImportError:
+        pass   # OK — model not downloaded in test env
+    except Exception as exc:
+        pytest.fail(f"Unexpected exception (not ImportError): {exc}")
+
+
+@pytest.mark.unit
+def test_ENG33_factory_error_message_includes_blip1():
+    """ValueError from unknown engine type must mention 'blip1'."""
+    from src.engines.factory import create_engine
+    with pytest.raises(ValueError, match="blip1"):
+        create_engine({"engine": {"type": "__nonexistent__"}})
+
+
+@pytest.mark.unit
+def test_ENG34_blip1_embed_dim_property():
+    """BLIP1Engine.embed_dim property must return 256."""
+    engine = _make_blip1_engine_mock()
+    assert engine.embed_dim == 256
+
+
+@pytest.mark.unit
+def test_ENG35_blip1_encode_frames_shape_norm_mock():
+    """encode_frames(): shape (N,256), float32, L2-normalised (mocked model)."""
+    import torch
+    from unittest.mock import MagicMock
+
+    N = 3
+    engine = _make_blip1_engine_mock()
+
+    # Processor: returns object with .pixel_values attribute
+    proc_out = MagicMock()
+    proc_out.pixel_values = torch.zeros(N, 3, 384, 384)
+    engine._processor.return_value = proc_out
+
+    # Vision model: returns last_hidden_state (proper tensor)
+    vision_out = MagicMock()
+    vision_out.last_hidden_state = torch.randn(N, 577, 768)
+    engine._model.vision_model.return_value = vision_out
+
+    # image_projection: returns random tensor (will be L2-normalised)
+    engine._model.image_projection.return_value = torch.randn(N, 256)
+
+    frames = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(N)]
+    out    = engine.encode_frames(frames)
+
+    assert out.shape == (N, 256), f"Expected ({N}, 256), got {out.shape}"
+    assert out.dtype == np.float32
+    norms = np.linalg.norm(out, axis=1)
+    assert np.allclose(norms, 1.0, atol=1e-4), f"Norms not ≈ 1.0: {norms}"
+
+
+@pytest.mark.unit
+def test_ENG36_blip1_encode_text_shape_norm_mock():
+    """encode_text(): shape (N,256), float32, L2-normalised (mocked model)."""
+    import torch
+    from unittest.mock import MagicMock
+
+    N = 2
+    engine = _make_blip1_engine_mock()
+
+    # Processor: returns text inputs
+    txt_out = MagicMock()
+    txt_out.input_ids      = torch.zeros(N, 10, dtype=torch.long)
+    txt_out.attention_mask = torch.ones(N, 10, dtype=torch.long)
+    engine._processor.return_value = txt_out
+
+    # Text encoder
+    text_enc_out = MagicMock()
+    text_enc_out.last_hidden_state = torch.randn(N, 10, 768)
+    engine._model.text_encoder.return_value = text_enc_out
+
+    # text_projection
+    engine._model.text_projection.return_value = torch.randn(N, 256)
+
+    texts = ["person running", "red car"]
+    out   = engine.encode_text(texts)
+
+    assert out.shape == (N, 256), f"Expected ({N}, 256), got {out.shape}"
+    assert out.dtype == np.float32
+    norms = np.linalg.norm(out, axis=1)
+    assert np.allclose(norms, 1.0, atol=1e-4)
+
+
+@pytest.mark.unit
+def test_ENG37_blip1_score_itm_shape_range_mock():
+    """score_itm(): shape (N,), float32, values in [0.0, 1.0] (mocked model)."""
+    import torch
+    from unittest.mock import MagicMock
+
+    N = 4
+    engine = _make_blip1_engine_mock()
+
+    # Processor: distinguish images vs text calls
+    img_proc_out = MagicMock()
+    img_proc_out.pixel_values = torch.zeros(N, 3, 384, 384)
+
+    txt_proc_out = MagicMock()
+    txt_proc_out.input_ids      = torch.zeros(N, 8, dtype=torch.long)
+    txt_proc_out.attention_mask = torch.ones(N, 8, dtype=torch.long)
+
+    def _proc_side_effect(*args, **kwargs):
+        return img_proc_out if "images" in kwargs else txt_proc_out
+
+    engine._processor.side_effect = _proc_side_effect
+
+    # Vision model
+    vision_out = MagicMock()
+    vision_out.last_hidden_state = torch.zeros(N, 577, 768)
+    engine._model.vision_model.return_value = vision_out
+
+    # Text encoder (ITM fusion)
+    text_out = MagicMock()
+    text_out.last_hidden_state = torch.zeros(N, 8, 768)
+    engine._model.text_encoder.return_value = text_out
+
+    # ITM head: return logits that produce varied probabilities
+    engine._model.itm_head.return_value = torch.tensor(
+        [[2.0, -1.0], [-1.0, 2.0], [0.5, 0.5], [1.0, -0.5]], dtype=torch.float32
+    )
+
+    frames = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(N)]
+    probs  = engine.score_itm(frames, "person running")
+
+    assert probs.shape == (N,), f"Expected ({N},), got {probs.shape}"
+    assert probs.dtype == np.float32
+    assert np.all(probs >= 0.0) and np.all(probs <= 1.0), \
+        f"Probabilities out of [0,1]: {probs}"
+
+
+@pytest.mark.unit
+def test_ENG38_blip1_encode_frames_empty():
+    """encode_frames([]) must return shape (0, 256) without errors."""
+    engine = _make_blip1_engine_mock()
+    out = engine.encode_frames([])
+    assert out.shape == (0, 256)
+    assert out.dtype == np.float32

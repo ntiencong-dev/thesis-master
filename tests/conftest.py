@@ -101,18 +101,28 @@ def searcher_with_real_video(real_video_path, tmp_path_factory):
     """
     NLVideoSearcher with the real video already indexed.
     Heavy fixture — created once per session.
+    Uses a unique Qdrant collection so tests don't pollute nlvs_segments.
+    The collection is deleted before indexing so each test session starts
+    from exactly 0 points (prevents vector count from drifting across runs).
     """
     import warnings
     warnings.filterwarnings("ignore")
 
-    index_dir = str(tmp_path_factory.mktemp("searcher_index"))
+    # Wipe the test collection so previous runs don't accumulate.
+    try:
+        from qdrant_client import QdrantClient
+        _c = QdrantClient(url="http://localhost:6333")
+        _c.delete_collection("nlvs_segments_test")
+    except Exception:
+        pass   # collection may not exist yet; that's fine
+
     from src.searcher import NLVideoSearcher
     s = NLVideoSearcher.from_params(
-        index_dir=index_dir,
         use_sliding_window=True,
         window_sec=5.0,
         overlap_ratio=0.5,
         frames_per_window=3,    # fewer frames → faster session fixture
+        qdrant_collection="nlvs_segments_test",
     )
     s.index_video(real_video_path)
     return s

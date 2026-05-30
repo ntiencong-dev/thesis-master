@@ -1,13 +1,12 @@
 """
 tests/unit/test_reranker.py
 ----------------------------
-Phase 3 unit tests for BLIP2Reranker and RerankResult.
+Phase 3 unit tests for BLIP2Reranker, BLIP1ITMReranker, and RerankResult.
 All tests are mock-based — no model is loaded.
 
 Scenarios covered
 -----------------
-RR-01   BLIP2Reranker is importable without transformers installed
-         (BLIP2_AVAILABLE flag is set correctly)
+RR-01   BLIP2Reranker and BLIP1ITMReranker importable; flags set correctly
 RR-02   BLIP2Reranker instantiation with lazy_load=True does not load model
 RR-03   BLIP2Reranker.is_loaded is False before first rerank call
 RR-04   BLIP2Reranker.rerank() with empty candidates returns []
@@ -25,6 +24,19 @@ RR-15   RerankResult fields match candidate values
 RR-16   set_reranker attaches reranker to NLVideoSearcher
 RR-17   search() signature accepts use_reranker parameter
 RR-18   search() with use_reranker=False and no reranker returns normal results
+RR-19   RerankResult has absolute_start and absolute_end fields (default 0.0)
+BLIP1ITMReranker unit tests (all mock-based)
+ITM-01  BLIP1ITMReranker importable from src.reranker
+ITM-02  BLIP1ITMReranker.rerank() with empty candidates returns []
+ITM-03  BLIP1ITMReranker.rerank() returns all candidates when top_k=None
+ITM-04  BLIP1ITMReranker.rerank() respects top_k limit
+ITM-05  BLIP1ITMReranker.rerank() output sorted by combined score descending
+ITM-06  combined score = alpha * cosine + (1-alpha) * itm_prob
+ITM-07  rank is sequential starting at 1
+ITM-08  _extract_frame fallback for missing video → (224,224,3) zero array
+ITM-09  engine.score_itm called with all candidate frames at once
+ITM-10  RerankResult fields match candidate (video_id, video_path, times)
+ITM-11  absolute_start / absolute_end forwarded from SearchResult
 """
 
 from __future__ import annotations
@@ -92,6 +104,7 @@ def test_RR01_reranker_module_importable():
     """src.reranker must be importable regardless of transformers install."""
     import src.reranker as mod
     assert hasattr(mod, "BLIP2Reranker")
+    assert hasattr(mod, "BLIP1ITMReranker")
     assert hasattr(mod, "RerankResult")
     assert hasattr(mod, "BLIP2_AVAILABLE")
 
@@ -406,3 +419,255 @@ def test_RR18_search_no_reranker_no_error():
     import inspect
     sig = inspect.signature(s.search)
     assert "use_reranker" in sig.parameters
+
+
+# ── RR-19  RerankResult has absolute_start / absolute_end ────────────────
+
+def test_RR19_rerank_result_has_absolute_fields():
+    """RerankResult must have absolute_start and absolute_end, defaulting to 0.0."""
+    from src.reranker import RerankResult
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(RerankResult)}
+    assert "absolute_start" in field_names, "RerankResult missing absolute_start"
+    assert "absolute_end"   in field_names, "RerankResult missing absolute_end"
+
+    r = RerankResult(
+        rank=1, score=0.5, cosine_score=0.5, blip_score=0.5,
+        video_id="v0", video_path="/p.mp4", start_time=0.0, end_time=5.0,
+    )
+    assert r.absolute_start == 0.0
+    assert r.absolute_end   == 0.0
+
+    r2 = RerankResult(
+        rank=1, score=0.5, cosine_score=0.5, blip_score=0.5,
+        video_id="v0", video_path="/p.mp4", start_time=0.0, end_time=5.0,
+        absolute_start=10.0, absolute_end=15.0,
+    )
+    assert r2.absolute_start == 10.0
+    assert r2.absolute_end   == 15.0
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# BLIP1ITMReranker unit tests  (ITM-01 .. ITM-11)
+# All mock-based — no model loaded, no disk I/O
+# ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class _FakeSearchResultFull:
+    """Extended fake SearchResult with absolute_start / absolute_end."""
+    score:          float
+    video_id:       str
+    video_path:     str
+    start_time:     float
+    end_time:       float
+    rank:           int
+    absolute_start: float = 0.0
+    absolute_end:   float = 0.0
+
+
+def _make_itm_candidates(n: int = 3) -> List[_FakeSearchResultFull]:
+    return [
+        _FakeSearchResultFull(
+            score=0.9 - i * 0.1,
+            video_id=f"vid{i}",
+            video_path=f"/fake/vid{i}.mp4",
+            start_time=float(i * 5),
+            end_time=float(i * 5 + 5),
+            rank=i + 1,
+            absolute_start=float(i * 5 + 100),
+            absolute_end=float(i * 5 + 105),
+        )
+        for i in range(n)
+    ]
+
+
+def _make_blip1_itm_reranker(n_candidates: int = 3, alpha: float = 0.6,
+                              itm_scores=None):
+    """Return a BLIP1ITMReranker with score_itm mocked out."""
+    from src.reranker import BLIP1ITMReranker
+
+    if itm_scores is None:
+        itm_scores = np.array(
+            [0.8 - i * 0.1 for i in range(n_candidates)], dtype=np.float32
+        )
+
+    mock_engine = MagicMock()
+    mock_engine.score_itm.return_value = np.asarray(itm_scores, dtype=np.float32)
+
+    reranker = BLIP1ITMReranker(engine=mock_engine, alpha=alpha)
+    # Bypass real video I/O
+    reranker._extract_frame = lambda path, t0, t1: np.zeros((224, 224, 3), dtype=np.uint8)
+    return reranker, mock_engine
+
+
+# ── ITM-01  importable ────────────────────────────────────────────────────
+
+@pytest.mark.unit
+def test_ITM01_blip1_itm_reranker_importable():
+    """BLIP1ITMReranker must be importable from src.reranker."""
+    from src.reranker import BLIP1ITMReranker, RerankResult
+    assert callable(BLIP1ITMReranker)
+    assert hasattr(RerankResult, "absolute_start")
+    assert hasattr(RerankResult, "absolute_end")
+
+
+# ── ITM-02  empty candidates → [] ────────────────────────────────────────
+
+@pytest.mark.unit
+def test_ITM02_rerank_empty_candidates():
+    """BLIP1ITMReranker.rerank() with empty list must return []."""
+    reranker, _ = _make_blip1_itm_reranker(n_candidates=0, itm_scores=np.array([]))
+    result = reranker.rerank([], "test query")
+    assert result == []
+
+
+# ── ITM-03  all candidates returned when top_k=None ──────────────────────
+
+@pytest.mark.unit
+def test_ITM03_rerank_returns_all_without_top_k():
+    """All candidates returned when top_k=None."""
+    N = 5
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=N)
+    mock_eng.score_itm.return_value = np.linspace(0.9, 0.5, N, dtype=np.float32)
+
+    result = reranker.rerank(_make_itm_candidates(N), "query", top_k=None)
+    assert len(result) == N
+
+
+# ── ITM-04  top_k respected ───────────────────────────────────────────────
+
+@pytest.mark.unit
+def test_ITM04_rerank_respects_top_k():
+    """top_k must limit output length."""
+    N, K = 5, 3
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=N)
+    mock_eng.score_itm.return_value = np.linspace(0.9, 0.5, N, dtype=np.float32)
+
+    result = reranker.rerank(_make_itm_candidates(N), "query", top_k=K)
+    assert len(result) == K
+
+
+# ── ITM-05  output sorted descending by combined score ───────────────────
+
+@pytest.mark.unit
+def test_ITM05_rerank_sorted_descending():
+    """Output must be sorted by combined score descending."""
+    N = 4
+    itm_scores = np.array([0.2, 0.9, 0.5, 0.7], dtype=np.float32)
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=N, itm_scores=itm_scores)
+
+    cands = _make_itm_candidates(N)
+    result = reranker.rerank(cands, "query", top_k=None)
+
+    scores = [r.score for r in result]
+    assert scores == sorted(scores, reverse=True), \
+        f"Results not sorted descending: {scores}"
+
+
+# ── ITM-06  combined score formula ───────────────────────────────────────
+
+@pytest.mark.unit
+def test_ITM06_combined_score_formula():
+    """combined_score = alpha * cosine + (1-alpha) * itm_prob."""
+    alpha = 0.6
+    cosine = 0.8     # from _FakeSearchResultFull.score
+    itm    = 0.5
+
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=1, alpha=alpha,
+                                                   itm_scores=np.array([itm]))
+    cand = _FakeSearchResultFull(
+        score=cosine, video_id="v0", video_path="/p.mp4",
+        start_time=0.0, end_time=5.0, rank=1,
+    )
+    result = reranker.rerank([cand], "query")
+
+    expected = alpha * cosine + (1 - alpha) * itm
+    assert len(result) == 1
+    assert abs(result[0].score - expected) < 1e-4, \
+        f"Expected {expected:.4f}, got {result[0].score:.4f}"
+
+
+# ── ITM-07  rank is sequential starting at 1 ─────────────────────────────
+
+@pytest.mark.unit
+def test_ITM07_rank_sequential_from_one():
+    """RerankResult.rank must be 1-based and sequential."""
+    N = 4
+    itm_scores = np.array([0.9, 0.7, 0.5, 0.3], dtype=np.float32)
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=N, itm_scores=itm_scores)
+
+    result = reranker.rerank(_make_itm_candidates(N), "query", top_k=None)
+    assert [r.rank for r in result] == list(range(1, N + 1))
+
+
+# ── ITM-08  _extract_frame fallback for missing video ────────────────────
+
+@pytest.mark.unit
+def test_ITM08_extract_frame_fallback_missing_video():
+    """_extract_frame should return a (224,224,3) zero array for missing video."""
+    from src.reranker import BLIP1ITMReranker
+
+    mock_engine = MagicMock()
+    reranker = BLIP1ITMReranker(engine=mock_engine, alpha=0.6)
+
+    frame = reranker._extract_frame("/nonexistent/path.mp4", 0.0, 5.0)
+    assert isinstance(frame, np.ndarray), "Expected ndarray"
+    assert frame.shape == (224, 224, 3), f"Expected (224,224,3), got {frame.shape}"
+
+
+# ── ITM-09  engine.score_itm called with all frames batched ──────────────
+
+@pytest.mark.unit
+def test_ITM09_score_itm_called_with_all_frames():
+    """engine.score_itm must be called exactly once with all candidate frames."""
+    N = 3
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=N)
+    cands = _make_itm_candidates(N)
+    reranker.rerank(cands, "person walking")
+
+    assert mock_eng.score_itm.call_count == 1
+    call_args = mock_eng.score_itm.call_args
+    frames_arg = call_args[0][0]   # first positional arg
+    assert len(frames_arg) == N, f"Expected {N} frames passed, got {len(frames_arg)}"
+
+
+# ── ITM-10  RerankResult fields match candidate ───────────────────────────
+
+@pytest.mark.unit
+def test_ITM10_rerank_result_fields_match_candidate():
+    """RerankResult fields must match the original SearchResult candidate."""
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=1,
+                                                   itm_scores=np.array([0.7]))
+    cand = _FakeSearchResultFull(
+        score=0.85, video_id="cam1", video_path="/data/cam1.mp4",
+        start_time=10.0, end_time=20.0, rank=1,
+        absolute_start=110.0, absolute_end=120.0,
+    )
+    result = reranker.rerank([cand], "red car")
+
+    assert len(result) == 1
+    r = result[0]
+    assert r.video_id   == "cam1"
+    assert r.video_path == "/data/cam1.mp4"
+    assert r.start_time == 10.0
+    assert r.end_time   == 20.0
+
+
+# ── ITM-11  absolute_start / absolute_end forwarded from SearchResult ──────
+
+@pytest.mark.unit
+def test_ITM11_absolute_fields_forwarded():
+    """absolute_start and absolute_end must be forwarded to RerankResult."""
+    reranker, mock_eng = _make_blip1_itm_reranker(n_candidates=1,
+                                                   itm_scores=np.array([0.6]))
+    cand = _FakeSearchResultFull(
+        score=0.80, video_id="cam2", video_path="/data/cam2.mp4",
+        start_time=5.0, end_time=10.0, rank=1,
+        absolute_start=205.0, absolute_end=210.0,
+    )
+    result = reranker.rerank([cand], "person at desk")
+
+    r = result[0]
+    assert r.absolute_start == 205.0, f"Expected 205.0, got {r.absolute_start}"
+    assert r.absolute_end   == 210.0, f"Expected 210.0, got {r.absolute_end}"

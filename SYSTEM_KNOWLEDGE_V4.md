@@ -22,15 +22,15 @@ Hai chế độ hoạt động:
 | Thành phần | Công nghệ |
 |---|---|
 | Ngôn ngữ | Python 3.10 |
-| Visual-Language Model | **EVA-CLIP ViT-L/14** (`EVA02-L-14/merged2b_s4b_b131k`) via `open_clip` |
-| Vector DB | **Qdrant** `http://localhost:6333`, collection `nlvs_segments` (sole backend since v3.0) |
+| Visual-Language Model | **EVA-CLIP ViT-L/14** (`EVA02-L-14/merged2b_s4b_b131k`) via `open_clip` (pc.yaml) hoặc **BLIP-1 ViT-B/16** (`blip-itm-base-coco`) via `transformers` (pc_blip1.yaml) |
+| Vector DB | **Qdrant** `http://localhost:6333`, collection `nlvs_segments` (768-dim) hoặc `nlvs_segments_blip1` (256-dim) |
 | Video decode | OpenCV (`cv2.VideoCapture`) hoặc GStreamer |
 | Job queue | **SQLite WAL** (`segments/job_queue.db`) |
 | Web UI | **Streamlit** v1.32.0 (`localhost:8501`) |
 | REST API | **FastAPI** + Uvicorn (`localhost:8000`) |
 | Scene detection | PySceneDetect `ContentDetector` (optional) |
 | Query translation | `deep_translator` (Vietnamese → English) |
-| 2-stage reranker | **BLIP-2** `blip2-opt-2.7b` (optional, lazy-load) |
+| 2-stage reranker | **BLIP-2** `blip2-opt-2.7b` (`BLIP2Reranker`, optional) hoặc **BLIP-1 ITM** `blip-itm-base-coco` (`BLIP1ITMReranker`, preferred) |
 | Caption augment | **BLIP-1** `blip-image-captioning-base` (optional) |
 | Edge deployment | AMD Kria KV260 / VART + XIR (`.xmodel`) |
 | Container | Docker (multi-stage: `base-pc` / `base-kria`) |
@@ -176,13 +176,21 @@ pending → processing → done
 
 ## 4. THUẬT TOÁN AI & XỬ LÝ DỮ LIỆU
 
-### 4.1 Mô hình đang dùng (production)
+### 4.1 Mô hình đang dùng
 
-**EVA-CLIP ViT-L/14** — `open_clip` model `EVA02-L-14`, weights `merged2b_s4b_b131k`  
-- Embedding dim: **768**  
-- ImageNet zero-shot: 79.8% (vs 68.3% của ViT-B/16)  
-- VRAM FP16: ~1.4 GB trên GTX 1650 Ti  
-- Load time: ~25s (cached bởi `@st.cache_resource`)
+**Option A — EVA-CLIP ViT-L/14** (`pc.yaml`, collection `nlvs_segments`)
+- Embedding dim: **768**
+- ImageNet zero-shot: 79.8%
+- VRAM FP16: ~1.4 GB trên GTX 1650 Ti
+- Load time: ~25s
+
+**Option B — BLIP-1 ITC ViT-B/16** (`pc_blip1.yaml`, collection `nlvs_segments_blip1`) — **thesis primary**
+- Model: `Salesforce/blip-itm-base-coco` (`BlipForImageTextRetrieval` via `transformers`)
+- Embedding dim: **256** (ITC projection)
+- Input size: 384×384 (BlipProcessor auto-resize)
+- Reranker: `BLIP1ITMReranker` — ITM cross-encoder (no second model load)
+- ITM latency: ~46ms/candidate trên ARM Cortex-A53 → 50 cands ≈ 2.3s
+- Blocker Kria: `.xmodel` chưa compile từ Vitis AI
 
 ### 4.2 Video embedding pipeline
 
@@ -233,12 +241,22 @@ Khi `adaptive_threshold=True`: nếu top-1 score < `score_threshold` (0.10), t�
 
 ### 4.6 2-stage reranker (Phase 3, optional)
 
+**BLIP-2 path** (legacy, với `pc.yaml`):
 ```
 Stage 1: EVA-CLIP cosine → Top-50 candidates  (fast, ms)
 Stage 2: BLIP-2 VQA → "Does scene contain <query>?" → yes/no log-prob
 Score = 0.6 × cosine + 0.4 × blip_score
 ```
 **VRAM constraint**: BLIP-2 OPT-2.7B (8-bit) = 2.8 GB + EVA-CLIP 1.4 GB > 4 GB → dùng `device="cpu"` cho BLIP-2 hoặc unload CLIP trước.
+
+**BLIP-1 ITM path** (preferred, với `pc_blip1.yaml`):
+```
+Stage 1: BLIP-1 ITC cosine → Top-50 candidates  (fast, ms)
+Stage 2: BLIP-1 ITM cross-encoder → match probability [0,1]
+Score = 0.6 × cosine + 0.4 × itm_prob
+```
+`BLIP1ITMReranker` reuses same `BLIP1Engine` instance — **không load thêm model**.
+Enabled via `search.use_itm_reranker: true` trong `pc_blip1.yaml`.
 
 ### 4.7 Scene-aware segmentation (Phase 2, optional)
 
@@ -258,8 +276,9 @@ PySceneDetect `ContentDetector` (HSV histogram diff, threshold=27.0):
 
 ## 5. KIẾN TRÚC TRIỂN KHAI & HẠ TẦNG
 
-### 5.1 Cấu hình chính xác (production hiện tại — pc.yaml)
+### 5.1 Cấu hình chính xác
 
+**pc.yaml** (EVA-CLIP, 768-dim):
 ```yaml
 engine:
   type: pc
@@ -268,22 +287,28 @@ engine:
   device: cuda
   batch_size: 16
   frames_per_window: 5
-
-pipeline:
-  video_backend: opencv
-  window_sec: 10.0
-  overlap_ratio: 0.30        # stride = 7.0s
-
 index:
   embed_dim: 768
-  backend: qdrant
-  qdrant_url: http://localhost:6333
   qdrant_collection: nlvs_segments
-
 search:
-  top_k: 5
   score_threshold: 0.10      # EVA-CLIP screen-capture scores ~0.15-0.18
-  nms_iou_threshold: 0.30
+```
+
+**pc_blip1.yaml** (BLIP-1 ITC+ITM, 256-dim — thesis primary):
+```yaml
+engine:
+  type: blip1
+  model_name: Salesforce/blip-itm-base-coco
+  device: cuda
+  batch_size: 8
+index:
+  embed_dim: 256
+  qdrant_collection: nlvs_segments_blip1
+search:
+  score_threshold: 0.20
+  use_itm_reranker: true
+  itm_top_k: 50
+  itm_alpha: 0.6
 ```
 
 ### 5.2 Docker
@@ -391,16 +416,19 @@ Cần: máy có Vitis AI 3.5 toolchain + calibration dataset (1000 ảnh ImageNe
 
 ## 6. TRẠNG THÁI HIỆN TẠI & CÁC ĐẶC ĐIỂM QUAN TRỌNG
 
-### 6.1 Trạng thái hệ thống (tính đến v2.9)
+### 6.1 Trạng thái hệ thống (tính đến v3.1 — BLIP-1 integration)
 
 | Thành phần | Trạng thái |
 |---|---|
-| Qdrant | ✅ running, `restart=unless-stopped`, **90 points**, collection `nlvs_segments` |
-| EVA-CLIP | ✅ loaded via `@st.cache_resource`, CUDA, embed_dim=768 |
+| Qdrant | ✅ running, `restart=unless-stopped`, collection `nlvs_segments` (768-dim) |
+| EVA-CLIP engine | ✅ `config/pc.yaml`, embed_dim=768 |
+| BLIP-1 ITC+ITM engine | ✅ `config/pc_blip1.yaml`, embed_dim=256, `nlvs_segments_blip1` |
+| BLIP1ITMReranker | ✅ implemented in `src/reranker.py`, mock-tested |
+| Kria BLIP-1 config | ✅ `config/kria_blip1.yaml` (xmodel pending Vitis AI compile) |
 | Streamlit | ✅ `localhost:8501` |
 | FastAPI | ✅ `localhost:8000` |
 | Job queue DB | `./segments/job_queue.db` |
-| Test suite | 220 passed, 14 skipped |
+| Test suite | 119+ unit passed, ENG-31..38 / ITM-01..11 / RR-19 added |
 
 ### 6.2 API breaks đã fix (quan trọng để không bị fix lại)
 
@@ -692,18 +720,30 @@ IoU([14-24], [21-31]) = overlap/union = 3/(14+3) = 0.176 < 0.30 → KEEP
 
 Nếu IoU > 0.30: chỉ giữ window có score cao hơn. Đây là temporal analog của NMS trong object detection (chỉ khác: 1D thay vì 2D bounding boxes).
 
-### 9.11 BLIP-2 reranker — tại sao cần stage 2?
+### 9.11 Stage-2 reranker — tại sao cần?
 
-CLIP là **bi-encoder**: text và image encode riêng lẻ → không có cross-modal interaction trong forward pass → bỏ mất fine-grained alignment.
+CLIP / BLIP-1 ITC là **bi-encoder**: text và image encode riêng lẻ → không có cross-modal interaction trong forward pass → bỏ mất fine-grained alignment.
 
-BLIP-2 là **cross-encoder**: frame và query được xử lý **jointly** qua Q-Former (Querying Transformer):
+**BLIP-2 path** (legacy): Q-Former cross-encoder, ~500ms/frame CPU.
 ```
-Frame + Query → Q-Former (cross-attention) → "Yes, this scene contains {query}" / "No"
+Frame + Query → Q-Former → "Yes" / "No"
 ```
 
-Cross-attention captures chi tiết như: "người mặc áo **đỏ**" vs "người mặc áo **xanh**" — điều mà bi-encoder dễ bỏ qua vì màu sắc là fine-grained feature.
+**BLIP-1 ITM path** (preferred, không cần model thứ 2):
+```
+Frame + Query → vision_model → image_feats
+image_feats + text_tokens → text_encoder(cross-attention) → [CLS] → itm_head → [match, no-match]
+```
+- `itm_head`: 2-class linear head trên [CLS] token sau cross-attention
+- Output: softmax `match_prob ∈ [0,1]` — dùng làm `blip_score`
+- Latency: ~46ms/cand trên ARM, ~8ms trên GTX 1650 Ti
+- **Không load thêm model**: dùng lại cùng `BLIP1Engine` instance từ stage 1
 
-**Trade-off**: BLIP-2 forward pass ~500ms/frame (CPU) vs CLIP search ~2ms. Dùng như stage-2 trên top-50 candidates thay vì toàn bộ index.
+**Pitfall BLIP-1 ITM**:
+- Dùng `image_projection` (không phải `vision_projection`) cho ITC
+- ITM phải pass `encoder_attention_mask = torch.ones(B, img_seq_len)` — thiếu → wrong scores
+
+Cross-attention captures chi tiết như: "người mặc áo **đỏ**" vs "người mặc áo **xanh**" mà bi-encoder dễ bỏ qua.
 
 ### 9.12 Tóm tắt: tại sao hệ thống hoạt động được
 
@@ -740,6 +780,22 @@ Toàn bộ không cần training trên domain cụ thể — đây là **zero-sh
 ---
 
 ## 10. CHANGELOG
+
+### v3.1 (BLIP-1 ITC+ITM integration — branch `v1.0.3_pc_real_camera_replace_reranker_algo`)
+- **Added**: `src/engines/blip1_engine.py` — `BLIP1Engine` with ITC (256-dim) + ITM cross-encoder mode
+- **Added**: `src/reranker.py` — `BLIP1ITMReranker` class (alpha=0.6, no second model load)
+- **Added**: `RerankResult.absolute_start` / `absolute_end` fields (default 0.0)
+- **Changed**: `src/engines/factory.py` — registered `blip1` engine type
+- **Fixed**: `src/searcher.py` — `r.cam_id` → `r.video_id` bug; `absolute_start/end` KeyError
+- **Fixed**: `src/searcher.py` — `_init_qdrant()` now raises `RuntimeError` on embed_dim mismatch
+- **Fixed**: `src/reranker.py` — `BLIP2Reranker.rerank()` now sets `absolute_start/end`
+- **Fixed**: `src/searcher.py` — `_search_qdrant()` now squeezes `(1,D)` → `(D,)` before `query_points()` to prevent "Conversion between multi and regular vectors failed" (encode_text always returns shape `(N,D)`)
+- **Fixed**: `tests/integration/test_api.py::test_API07` — replaced `from_params(index_dir=None)` (removed in v3.0) with `from_params(qdrant_collection="nlvs_segments_api07_empty")` for proper empty-collection 409 test
+- **Fixed**: `api/main.py` — replaced `searcher._index.total_vectors()` (Faiss, removed v3.0) with `_qdrant_total(searcher)` in all 5 call sites
+- **Fixed**: `tests/conftest.py` — `searcher_with_real_video` removed `index_dir` arg (not in `from_params()` since v3.0); uses `qdrant_collection="nlvs_segments_test"` to isolate test data
+- **Added**: `config/pc_blip1.yaml` — BLIP-1 PC config (256-dim, `nlvs_segments_blip1`)
+- **Added**: `config/kria_blip1.yaml` — Kria BLIP-1 config (xmodel pending)
+- **Tests added**: ENG-31..38 (BLIP1Engine), ITM-01..11 (BLIP1ITMReranker), RR-19 (RerankResult fields), QN-23 (dim mismatch guard)
 
 ### v3.0 (Qdrant-only refactor)
 - **Removed**: Faiss/VideoIndex/ScalableVideoIndex từ toàn bộ codebase

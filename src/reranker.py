@@ -54,15 +54,17 @@ except (ImportError, RuntimeError, AttributeError):
 
 @dataclass
 class RerankResult:
-    """Reranked search result with separate cosine and BLIP scores."""
-    score:        float   # combined score
-    cosine_score: float   # Stage-1 cosine similarity
-    blip_score:   float   # Stage-2 BLIP-2 yes/no probability
-    video_id:     str
-    video_path:   str
-    start_time:   float
-    end_time:     float
-    rank:         int
+    """Reranked search result with separate cosine and BLIP/ITM scores."""
+    score:          float   # combined score
+    cosine_score:   float   # Stage-1 cosine similarity
+    blip_score:     float   # Stage-2 VQA / ITM probability
+    video_id:       str
+    video_path:     str
+    start_time:     float
+    end_time:       float
+    rank:           int
+    absolute_start: float = 0.0   # wall-clock unix timestamp (0 for pre-recorded)
+    absolute_end:   float = 0.0
 
 
 class BLIP2Reranker:
@@ -180,6 +182,8 @@ class BLIP2Reranker:
                 start_time=cand.start_time,
                 end_time=cand.end_time,
                 rank=i + 1,
+                absolute_start=getattr(cand, "absolute_start", 0.0),
+                absolute_end=getattr(cand, "absolute_end", 0.0),
             )
             for i, (combined, cosine, blip, cand) in enumerate(scored)
         ]
@@ -267,3 +271,125 @@ class BLIP2Reranker:
             )
         answer = self._processor.decode(out[0], skip_special_tokens=True).strip().lower()
         return 1.0 if answer.startswith("yes") else 0.0
+
+
+# ---------------------------------------------------------------------------
+# BLIP-1 ITM reranker (Phase 3 — replaces BLIP2Reranker for Kria KV260)
+# ---------------------------------------------------------------------------
+
+class BLIP1ITMReranker:
+    """
+    Stage-2 reranker using BLIP-1 ITM (Image-Text Matching) fusion encoder.
+
+    Unlike BLIP2Reranker, this class **reuses** the BLIP1Engine already loaded
+    for stage-1 search — no additional model is loaded into memory.
+
+    Architecture
+    ------------
+    For each top-K candidate:
+      1. Extract representative (midpoint) frame from the video segment.
+      2. engine.score_itm([frame], query) → ITM match probability via:
+           ViT-B/16 → image patch features
+           BERT + cross-attention over patches → [CLS] → ITM head → P(match)
+      3. combined = alpha × cosine_score + (1-alpha) × itm_prob
+
+    Kria KV260 latency profile
+    --------------------------
+    ViT-B/16 INT8 on DPU B4096 : ~12 ms/frame
+    BERT cross-attention (ARM) : ~34 ms/candidate
+    Total per candidate         : ~46 ms
+    50 candidates               : ~2.3 s  (acceptable)
+
+    Parameters
+    ----------
+    engine : BLIP1Engine
+        Already-loaded BLIP1Engine instance (from stage-1 indexing/search).
+        Passing the same engine avoids double loading (saves ~220 MB VRAM).
+    alpha  : float
+        Weight of stage-1 cosine score.
+        combined = alpha × cosine + (1 - alpha) × itm_prob.
+    """
+
+    DEFAULT_ALPHA: float = 0.6
+
+    def __init__(self, engine, alpha: float = DEFAULT_ALPHA) -> None:
+        self._engine = engine
+        self.alpha   = alpha
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def rerank(
+        self,
+        candidates: list,   # List[SearchResult] from NLVideoSearcher.search()
+        query: str,
+        top_k: Optional[int] = None,
+    ) -> List[RerankResult]:
+        """
+        Rerank *candidates* using BLIP-1 ITM cross-encoder scores.
+
+        Parameters
+        ----------
+        candidates : list of SearchResult
+        query      : str — normalised search query (after _normalize_query)
+        top_k      : int | None — limit output; None returns all candidates
+
+        Returns
+        -------
+        List[RerankResult] sorted by combined score descending, .rank set.
+        """
+        if not candidates:
+            return []
+
+        # Extract one representative frame per candidate
+        frames = [
+            self._extract_frame(c.video_path, c.start_time, c.end_time)
+            for c in candidates
+        ]
+
+        # Batch ITM scoring: one engine call for all frames
+        itm_scores = self._engine.score_itm(frames, query)   # (N,) float32
+
+        scored: list = []
+        for cand, itm_s in zip(candidates, itm_scores):
+            combined = self.alpha * cand.score + (1.0 - self.alpha) * float(itm_s)
+            scored.append((combined, cand.score, float(itm_s), cand))
+
+        scored.sort(key=lambda x: -x[0])
+        if top_k is not None:
+            scored = scored[:top_k]
+
+        return [
+            RerankResult(
+                score=combined,
+                cosine_score=cosine,
+                blip_score=itm_s,            # blip_score field reused for ITM probability
+                video_id=cand.video_id,
+                video_path=cand.video_path,
+                start_time=cand.start_time,
+                end_time=cand.end_time,
+                rank=i + 1,
+                absolute_start=getattr(cand, "absolute_start", 0.0),
+                absolute_end=getattr(cand, "absolute_end", 0.0),
+            )
+            for i, (combined, cosine, itm_s, cand) in enumerate(scored)
+        ]
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _extract_frame(
+        self, video_path: str, start_time: float, end_time: float
+    ) -> np.ndarray:
+        """Extract the midpoint frame from a video segment (BGR, 224×224)."""
+        mid = (start_time + end_time) / 2.0
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        cap.set(cv2.CAP_PROP_POS_FRAMES, int(mid * fps))
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            return np.zeros((224, 224, 3), dtype=np.uint8)
+        return cv2.resize(frame, (224, 224))
