@@ -342,9 +342,18 @@ class BLIP1ITMReranker:
         if not candidates:
             return []
 
-        # Extract one representative frame per candidate
+        # Encode query once via ITC to select the best frame per candidate.
+        # encode_text returns (1, D); squeeze to (D,).
+        qvec = self._engine.encode_text(query)
+        if qvec.ndim > 1:
+            qvec = qvec[0]
+
+        # Extract representative frame per candidate: pick the frame whose
+        # ITC cosine to the query is highest rather than using a fixed
+        # midpoint.  This ensures ITM scores the frame where the query
+        # object actually appears, not an arbitrary temporal position.
         frames = [
-            self._extract_frame(c.video_path, c.start_time, c.end_time)
+            self._extract_best_frame(c.video_path, c.start_time, c.end_time, qvec)
             for c in candidates
         ]
 
@@ -380,10 +389,57 @@ class BLIP1ITMReranker:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _extract_best_frame(
+        self, video_path: str, start_time: float, end_time: float,
+        query_vec: "np.ndarray", n_candidates: int = 5,
+    ) -> np.ndarray:
+        """
+        Sample *n_candidates* frames uniformly across the segment, encode
+        them with the ITC visual encoder, and return the one whose cosine
+        similarity to *query_vec* is highest.
+
+        Rationale: a fixed midpoint heuristic can miss brief object
+        appearances (e.g. a hair dryer shown for 1-2 s inside a 10 s
+        window).  The ITC encoder already "knows" which frame looks most
+        like the query — reusing that signal to pick the ITM input frame
+        ensures the cross-encoder sees the most query-relevant content.
+        """
+        cap = cv2.VideoCapture(video_path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+        duration = cap.get(cv2.CAP_PROP_FRAME_COUNT) / fps
+        t1_actual = min(end_time, duration)
+
+        # Sample timestamps
+        if n_candidates == 1:
+            timestamps = [(start_time + t1_actual) / 2.0]
+        else:
+            step = (t1_actual - start_time) / (n_candidates - 1)
+            timestamps = [start_time + i * step for i in range(n_candidates)]
+
+        frames_bgr: List[np.ndarray] = []
+        for t in timestamps:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ok, f = cap.read()
+            if ok and f is not None:
+                frames_bgr.append(f)
+        cap.release()
+
+        if not frames_bgr:
+            return np.zeros((224, 224, 3), dtype=np.uint8)
+
+        if len(frames_bgr) == 1:
+            return cv2.resize(frames_bgr[0], (224, 224))
+
+        # ITC cosine → pick best frame
+        embs = self._engine.encode_frames(frames_bgr)          # (N, D) L2-normalised
+        cosines = embs @ query_vec                              # (N,)
+        best_idx = int(np.argmax(cosines))
+        return cv2.resize(frames_bgr[best_idx], (224, 224))
+
     def _extract_frame(
         self, video_path: str, start_time: float, end_time: float
     ) -> np.ndarray:
-        """Extract the midpoint frame from a video segment (BGR, 224×224)."""
+        """Fallback: extract the midpoint frame (kept for backward-compat)."""
         mid = (start_time + end_time) / 2.0
         cap = cv2.VideoCapture(video_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 25.0

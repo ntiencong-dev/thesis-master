@@ -8,7 +8,7 @@ Natural Language Video Search (NLVS) system: text queries retrieve timestamped v
 # Tests (run from project root with venv active)
 pytest tests/unit/ -m unit          # fast, no GPU/disk needed
 pytest tests/integration/ -m integration
-pytest tests/ -q                    # full suite (212 passed, 20 skipped expected)
+pytest tests/ -q                    # full suite (138+ passed, 1 skipped expected for reranker)
 
 # API server — PC prototype
 CONFIG=config/pc_blip1.yaml uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -65,7 +65,7 @@ Both configs use `Salesforce/blip-itm-base-coco` (BLIP-1 ViT-B/16). The PC confi
 All engines implement `InferenceEngine` ABC ([src/engines/base_engine.py](src/engines/base_engine.py)):
 - `encode_frames(frames_bgr: List[np.ndarray]) → np.ndarray` — shape `(N, embed_dim)`, float32, L2-normalized, BGR input
 - `encode_text(texts: str | List[str]) → np.ndarray` — shape `(N, embed_dim)`, always returns 2-D even for a single string
-- `encode_segment_frames(frames, n_frames=5)` — multi-frame average (shared default impl)
+- `encode_segment_frames(frames_bgr)` — **soft-max pooling** (shared default impl, defined in `base_engine.py`): encode all N frames → compute deviation from centroid → temperature-scaled softmax (T=0.5) → weighted sum → L2-normalize. Biases toward the most "extreme" frame (e.g. a brief object appearance) instead of plain mean pooling which dilutes rare events.
 
 `BLIP1Engine` additionally exposes:
 - `score_itm(frames_bgr, text) → np.ndarray` — shape `(N,)` float32 [0,1], ITM cross-encoder scores used by `BLIP1ITMReranker`
@@ -76,7 +76,11 @@ Create via factory: `create_engine(config)` in [src/engines/factory.py](src/engi
 
 `src/reranker.py` — stage-2 reranker for the BLIP-1 pipeline:
 
-`BLIP1ITMReranker(engine, alpha=0.6)` — takes the **same** `BLIP1Engine` instance used for indexing (no second model load). Extracts the midpoint frame of each candidate segment and runs BLIP-1 ITM cross-attention between the frame and the query.
+`BLIP1ITMReranker(engine, alpha=0.6)` — takes the **same** `BLIP1Engine` instance used for indexing (no second model load).
+
+**Frame selection:** `_extract_best_frame(path, t0, t1, query_vec, n_candidates=5)` — samples 5 frames uniformly across the segment, encodes them via ITC (`encode_frames`), computes cosine vs. `query_vec`, and passes the highest-cosine frame to ITM. This outperforms a fixed midpoint heuristic when the query object appears only briefly (e.g. dryer visible 1-2 s inside a 10 s window).
+
+**ITC vector:** `rerank()` calls `encode_text(query)` once to obtain the ITC query vector used in frame selection. `encode_text` returns shape `(1, D)`; the reranker squeezes it to `(D,)` before computing cosines.
 
 Combined score: `alpha × cosine_score + (1 − alpha) × itm_prob`
 
@@ -96,9 +100,11 @@ Enable in config: `search.use_itm_reranker: true`, `search.itm_top_k: 50`, `sear
 
 **Query normalization.** `_normalize_query()` in [src/searcher.py](src/searcher.py) strips imperative prefixes ("find", "show me", "search for") before encoding. Never encode raw user input directly.
 
-**BLIP-1 uses `image_projection`, not `vision_projection`.** `BlipForImageTextRetrieval` names the ITC visual projection head `self.image_projection`. Using `vision_projection` causes `AttributeError`.
+**BLIP-1 uses `vision_proj`, not `image_projection` or `vision_projection`.** In `blip1_engine.py`, the ITC visual projection head is accessed as `self._model.vision_proj`. Any other attribute name causes `AttributeError`.
 
 **BLIP-1 ITM cross-attention requires `encoder_attention_mask`.** Pass `torch.ones(B, img_seq_len)` as `encoder_attention_mask` when calling `text_encoder` in ITM mode. Omitting it produces silently wrong scores.
+
+**`_extract_best_frame` mock must be patched in tests.** When unit-testing `BLIP1ITMReranker`, mock `engine.encode_text.return_value = np.zeros(256, dtype=np.float32)` (1-D, not 2-D) and patch `reranker._extract_best_frame = lambda path, t0, t1, qvec, n_candidates=5: np.zeros((224,224,3), dtype=np.uint8)`. Patching only `_extract_frame` is insufficient since `rerank()` now calls `_extract_best_frame`.
 
 **`searcher_with_real_video` fixture clears `nlvs_segments_test` first.** The fixture is `scope="session"` and calls `QdrantClient.delete_collection("nlvs_segments_test")` before indexing. Without this, each test run appends vectors and point counts drift across runs (e.g. SR04 expects ≤45 but sees 120 on the 4th run).
 
@@ -123,6 +129,8 @@ This codebase is the **PC prototype** for a master's thesis on deploying a BLIP-
 |---|---|---|
 | Visual encoder | BLIP-1 ViT-B/16 (HuggingFace, CUDA) | BLIP-1 ViT-B/16 INT8 (DPU B4096, .xmodel) |
 | Text encoder + ITM | BLIP-1 BERT (HuggingFace, CUDA) | BLIP-1 BERT (ARM Cortex-A53 CPU) |
+| Segment pooling | Soft-max pooling T=0.5 (base_engine.py) | Same (hardware-agnostic) |
+| ITM frame selection | ITC-guided best-frame (n=5) | Same — ITC on DPU, cosine on CPU |
 | Index | Qdrant `nlvs_segments_blip1` 256-dim | Same collection (vectors portable) |
 | Config | `config/pc_blip1.yaml` | `config/kria_blip1.yaml` |
 

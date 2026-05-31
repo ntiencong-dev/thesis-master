@@ -494,10 +494,15 @@ def _make_blip1_itm_reranker(n_candidates: int = 3, alpha: float = 0.6,
 
     mock_engine = MagicMock()
     mock_engine.score_itm.return_value = np.asarray(itm_scores, dtype=np.float32)
+    # encode_text must return a 1-D numpy array so ndim check in rerank() works
+    mock_engine.encode_text.return_value = np.zeros(256, dtype=np.float32)
+    # encode_frames used by _extract_best_frame
+    mock_engine.encode_frames.return_value = np.zeros((1, 256), dtype=np.float32)
 
     reranker = BLIP1ITMReranker(engine=mock_engine, alpha=alpha)
-    # Bypass real video I/O
+    # Bypass real video I/O for both frame-extraction paths
     reranker._extract_frame = lambda path, t0, t1: np.zeros((224, 224, 3), dtype=np.uint8)
+    reranker._extract_best_frame = lambda path, t0, t1, qvec, n_candidates=5: np.zeros((224, 224, 3), dtype=np.uint8)
     return reranker, mock_engine
 
 
