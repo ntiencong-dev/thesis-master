@@ -43,7 +43,7 @@ warnings.filterwarnings("ignore")
 # We need to point the API at a real config + real video path.
 # Set environment vars BEFORE importing api.main so _CONFIG_PATH is set.
 _CONFIG_PATH = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "..", "config", "pc.yaml")
+    os.path.join(os.path.dirname(__file__), "..", "..", "config", "pc_blip1.yaml")
 )
 _INDEX_DIR = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "index_store_test_api")
@@ -155,7 +155,15 @@ def test_API07_search_empty_index_returns_409():
     app_module._searcher = None
 
     # Use a dedicated empty collection so this test is isolated from real data.
-    # from_params() creates the collection if it does not exist (0 vectors).
+    # Drop any stale collection first (e.g. leftover from a previous run with a
+    # different embed_dim) so from_params() always creates it fresh.
+    try:
+        from qdrant_client import QdrantClient as _QC
+        _QC(url="http://localhost:6333", timeout=5).delete_collection(
+            "nlvs_segments_api07_empty"
+        )
+    except Exception:
+        pass
     from src.searcher import NLVideoSearcher
     app_module._searcher = NLVideoSearcher.from_params(
         qdrant_collection="nlvs_segments_api07_empty"

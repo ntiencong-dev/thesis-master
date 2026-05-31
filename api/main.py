@@ -18,7 +18,7 @@ Run
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
 Or via config:
-    CONFIG=config/pc.yaml uvicorn api.main:app --host 0.0.0.0 --port 8000
+    CONFIG=config/pc_blip1.yaml uvicorn api.main:app --host 0.0.0.0 --port 8000
 """
 
 from __future__ import annotations
@@ -47,8 +47,8 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# Load config from environment variable; fall back to pc.yaml
-_CONFIG_PATH = os.environ.get("CONFIG", "config/pc.yaml")
+# Load config from environment variable; fall back to pc_blip1.yaml
+_CONFIG_PATH = os.environ.get("CONFIG", "config/pc_blip1.yaml")
 
 # Lazy-initialise the searcher (model loading is expensive)
 _searcher: Optional[NLVideoSearcher] = None

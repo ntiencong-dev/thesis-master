@@ -80,9 +80,10 @@ def tmp_index_dir():
 @pytest.fixture(scope="session")
 def clip_engine():
     """
-    Load the PC CLIP engine once for the whole test session.
-    Tests that need CLIP should request this fixture.
-    Phase 1: uses EVA02-L-14 (embed_dim=768) with graceful fallback to ViT-B-16.
+    Load the PC (EVA-CLIP) engine once for the whole test session.
+    Used by ENG-02..12 and feature-extractor unit tests.
+    Note: this is the legacy PCEngine (768-dim); the primary pipeline now
+    uses BLIP1Engine via searcher_with_real_video / NLVideoSearcher.from_params().
     """
     import warnings
     warnings.filterwarnings("ignore")
@@ -122,6 +123,8 @@ def searcher_with_real_video(real_video_path, tmp_path_factory):
         window_sec=5.0,
         overlap_ratio=0.5,
         frames_per_window=3,    # fewer frames → faster session fixture
+        model_name="Salesforce/blip-itm-base-coco",  # BLIP-1 ITC+ITM
+        embed_dim=256,
         qdrant_collection="nlvs_segments_test",
     )
     s.index_video(real_video_path)

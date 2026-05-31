@@ -95,6 +95,7 @@ class BLIP1Engine(InferenceEngine):
             self._model_name
         )
         dtype = torch.float16 if str(self._device).startswith("cuda") else torch.float32
+        self._dtype = dtype
         self._model: BlipForImageTextRetrieval = (
             BlipForImageTextRetrieval.from_pretrained(
                 self._model_name, torch_dtype=dtype
@@ -147,14 +148,14 @@ class BLIP1Engine(InferenceEngine):
             pil_images = [Image.fromarray(f[:, :, ::-1]) for f in batch]
 
             img_inputs   = self._processor(images=pil_images, return_tensors="pt")
-            pixel_values = img_inputs.pixel_values.to(self._device)
+            pixel_values = img_inputs.pixel_values.to(self._device, dtype=self._dtype)
 
             with torch.no_grad():
                 vision_out = self._model.vision_model(
                     pixel_values=pixel_values, return_dict=True
                 )
                 cls_feat = vision_out.last_hidden_state[:, 0, :]  # (B, hidden)
-                embed    = self._model.image_projection(cls_feat)  # (B, 256)
+                embed    = self._model.vision_proj(cls_feat)  # (B, 256)
                 embed    = F.normalize(embed, dim=-1)
 
             all_embeds.append(embed.float().cpu().numpy())
@@ -200,7 +201,7 @@ class BLIP1Engine(InferenceEngine):
                     return_dict=True,
                 )
                 cls_feat = text_out.last_hidden_state[:, 0, :]  # (B, hidden)
-                embed    = self._model.text_projection(cls_feat)  # (B, 256)
+                embed    = self._model.text_proj(cls_feat)  # (B, 256)
                 embed    = F.normalize(embed, dim=-1)
 
             all_embeds.append(embed.float().cpu().numpy())
@@ -257,7 +258,7 @@ class BLIP1Engine(InferenceEngine):
             # ── Vision encoder ──────────────────────────────────────────
             pil_images   = [Image.fromarray(f[:, :, ::-1]) for f in batch]
             img_inputs   = self._processor(images=pil_images, return_tensors="pt")
-            pixel_values = img_inputs.pixel_values.to(self._device)
+            pixel_values = img_inputs.pixel_values.to(self._device, dtype=self._dtype)
 
             # ── Text inputs (query repeated B times) ────────────────────
             txt_inputs = self._processor(

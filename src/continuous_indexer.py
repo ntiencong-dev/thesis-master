@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 # Optional watchdog import (file-system event monitoring)
 # ---------------------------------------------------------------------------
 try:
-    from watchdog.events import FileSystemEventHandler, FileCreatedEvent
+    from watchdog.events import FileSystemEventHandler, FileClosedEvent
     from watchdog.observers import Observer as WatchdogObserver
     _HAS_WATCHDOG = True
 except ImportError:
@@ -139,9 +139,9 @@ class ContinuousIndexer:
         Raises RuntimeError if Qdrant is unavailable (no Faiss fallback).
         """
         idx_cfg         = self._config.get("index", {})
-        embed_dim       = idx_cfg.get("embed_dim", 768)
+        embed_dim       = idx_cfg.get("embed_dim", 256)
         qdrant_url      = idx_cfg.get("qdrant_url",        "http://localhost:6333")
-        collection_name = idx_cfg.get("qdrant_collection", "nlvs_segments")
+        collection_name = idx_cfg.get("qdrant_collection", "nlvs_segments_blip1")
         try:
             from qdrant_client import QdrantClient
             from qdrant_client.models import Distance, VectorParams
@@ -185,12 +185,17 @@ class ContinuousIndexer:
             self._run_polling_watchdog(storage_dirs)
 
     def _run_inotify_watchdog(self, storage_dirs: List[str]) -> None:
-        """Use watchdog library (inotify on Linux) to watch for new files."""
+        """Use watchdog library (inotify on Linux) to watch for new files.
+
+        Uses IN_CLOSE_WRITE (on_closed) so the file is guaranteed to be fully
+        written before being enqueued — avoids 'moov atom not found' errors
+        that occur when on_created fires while ffmpeg is still writing.
+        """
         indexer_ref = self   # closure
 
         class _Handler(FileSystemEventHandler):
-            def on_created(self, event: FileCreatedEvent) -> None:
-                if not isinstance(event, FileCreatedEvent):
+            def on_closed(self, event: FileClosedEvent) -> None:
+                if not isinstance(event, FileClosedEvent):
                     return
                 path = Path(event.src_path)
                 if path.suffix.lower() != ".mp4":
@@ -202,9 +207,9 @@ class ContinuousIndexer:
                 indexer_ref._queue.enqueue(IndexJob(
                     cam_id=cam_id,
                     segment_path=str(path),
-                    capture_timestamp=time.time(),
+                    capture_timestamp=path.stat().st_mtime,
                 ))
-                logger.info("[CI-Watchdog] Enqueued %s", path.name)
+                logger.info("[CI-Watchdog] Enqueued (closed) %s", path.name)
 
         observer = WatchdogObserver()
         for d in storage_dirs:
@@ -220,7 +225,13 @@ class ContinuousIndexer:
         logger.info("[CI-Watchdog] inotify stopped.")
 
     def _run_polling_watchdog(self, storage_dirs: List[str]) -> None:
-        """Fallback polling watchdog when watchdog library is not installed."""
+        """Fallback polling watchdog when watchdog library is not installed.
+
+        Waits for file size to stabilise for two consecutive poll cycles before
+        enqueuing, so partially-written MP4s are never indexed.
+        """
+        # Maps path → last observed size (for stability check)
+        size_cache: dict[str, int] = {}
         seen: set[str] = set()
         logger.info("[CI-Watchdog] polling %s every %.1fs", storage_dirs, _POLL_INTERVAL)
 
@@ -233,17 +244,30 @@ class ContinuousIndexer:
                     key = str(f)
                     if key in seen:
                         continue
-                    seen.add(key)
-                    if self._breaker.is_open():
-                        logger.warning("[CI-Watchdog] CircuitBreaker OPEN — drop %s", f.name)
+                    try:
+                        size = f.stat().st_size
+                    except OSError:
+                        size_cache.pop(key, None)
                         continue
-                    cam_id = f.stem.split("_")[0]
-                    self._queue.enqueue(IndexJob(
-                        cam_id=cam_id,
-                        segment_path=key,
-                        capture_timestamp=f.stat().st_mtime,
-                    ))
-                    logger.info("[CI-Watchdog] Enqueued %s", f.name)
+                    if size == 0:
+                        continue
+                    prev = size_cache.get(key, -1)
+                    if prev == size:
+                        # Size stable since last poll — file is complete
+                        seen.add(key)
+                        size_cache.pop(key, None)
+                        if self._breaker.is_open():
+                            logger.warning("[CI-Watchdog] CircuitBreaker OPEN — drop %s", f.name)
+                            continue
+                        cam_id = f.stem.split("_")[0]
+                        self._queue.enqueue(IndexJob(
+                            cam_id=cam_id,
+                            segment_path=key,
+                            capture_timestamp=f.stat().st_mtime,
+                        ))
+                        logger.info("[CI-Watchdog] Enqueued (stable) %s", f.name)
+                    else:
+                        size_cache[key] = size
 
             self._stop.wait(timeout=_POLL_INTERVAL)
 

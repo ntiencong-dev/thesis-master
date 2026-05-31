@@ -10,7 +10,7 @@ CONTINUOUS_STREAM_RESEARCH.md v2.3:
     → OverlapCaptureDaemon  (60 s segments, 10 s tail overlap, stride 50 s)
     → PersistentJobQueue    (SQLite, crash-safe)
     → ContinuousIndexer     (watchdog + encoder + Qdrant)
-    → NLVideoSearcher       (EVA-CLIP ViT-L/14)
+    → NLVideoSearcher       (BLIP-1 ViT-B/16)
 
 Confirmed parameters (CONTINUOUS_STREAM_RESEARCH.md §2.1):
   window=10 s · overlap=30% · stride=7.0 s · frames=5 · min_score=0.20
@@ -162,8 +162,8 @@ def _grab_webcam_frame(source: str) -> Optional[np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def _make_indexer_config(segment_dir: str) -> dict:
-    """Build a pc.yaml-equivalent config dict pointing watchdog at segment_dir."""
-    cfg_path = os.path.join(os.path.dirname(__file__), "config", "pc.yaml")
+    """Build a pc_blip1.yaml-equivalent config dict pointing watchdog at segment_dir."""
+    cfg_path = os.path.join(os.path.dirname(__file__), "config", "pc_blip1.yaml")
     if os.path.isfile(cfg_path):
         with open(cfg_path) as f:
             cfg = yaml.safe_load(f) or {}
@@ -174,8 +174,8 @@ def _make_indexer_config(segment_dir: str) -> dict:
     cfg["capture"]["storage_dirs"] = [segment_dir]
     if "index" not in cfg or cfg["index"] is None:
         cfg["index"] = {}
-    # Note: backend is driven by pc.yaml — qdrant only
-    cfg["index"].setdefault("embed_dim", 768)
+    # Note: backend is driven by pc_blip1.yaml — qdrant only, embed_dim=256
+    cfg["index"].setdefault("embed_dim", 256)
     return cfg
 
 
@@ -349,14 +349,22 @@ def _pipeline_status() -> dict:
 @st.cache_resource
 def _load_searcher() -> NLVideoSearcher:
     """Load NLVideoSearcher once per process lifetime (survives Streamlit reruns)."""
-    cfg_path = os.path.join(os.path.dirname(__file__), "config", "pc.yaml")
+    cfg_path = os.path.join(os.path.dirname(__file__), "config", "pc_blip1.yaml")
     if os.path.isfile(cfg_path):
-        return NLVideoSearcher.from_config(cfg_path)
-    return NLVideoSearcher.from_params(
-        window_sec=_WINDOW_SEC,
-        overlap_ratio=_OVERLAP_RATIO,
-        frames_per_window=_FRAMES_PER_WINDOW,
-    )
+        s = NLVideoSearcher.from_config(cfg_path)
+    else:
+        s = NLVideoSearcher.from_params(
+            window_sec=_WINDOW_SEC,
+            overlap_ratio=_OVERLAP_RATIO,
+            frames_per_window=_FRAMES_PER_WINDOW,
+        )
+    # Attach BLIP-1 ITM reranker (reuses the already-loaded engine — no extra VRAM)
+    try:
+        from src.reranker import BLIP1ITMReranker
+        s.set_reranker(BLIP1ITMReranker(s._engine))
+    except Exception:
+        pass
+    return s
 
 
 def _get_searcher() -> NLVideoSearcher:
@@ -367,7 +375,7 @@ def _reset_searcher() -> None:
     """Reset Qdrant connection without destroying the cached model.
 
     Re-initialises Qdrant connection (useful after Qdrant restarts).
-    The heavy EVA-CLIP model stays cached so there is no 25-second reload,
+    The heavy BLIP-1 model stays cached so there is no reload penalty,
     and no Streamlit 1.32 ``expire_cache`` coroutine warning.
     """
     s = _load_searcher()
@@ -394,7 +402,7 @@ with st.sidebar:
             f"| `overlap_ratio` | **{int(_OVERLAP_RATIO*100)}%** (stride=7.0 s) |\n"
             f"| `frames_per_window` | **{_FRAMES_PER_WINDOW}** |\n"
             f"| `min_score` | **{_SCORE_THRESHOLD}** |\n"
-            f"| Engine | EVA-CLIP ViT-L/14 · embed=768 |\n"
+            f"| Engine | BLIP-1 ViT-B/16 · embed=256 |\n"
             f"| Capture stride | 50 s (segment=60 s, overlap=10 s) |\n"
         )
 
@@ -405,6 +413,12 @@ with st.sidebar:
         "Min similarity score", 0.00, 0.60, _SCORE_THRESHOLD, 0.01,
     )
     use_templates = st.toggle("CLIP prompt templates", value=True)
+    use_reranker  = st.toggle(
+        "ITM reranker (more accurate, slower)",
+        value=False,
+        help="BLIP-1 Image-Text Matching cross-encoder re-scores each candidate. "
+             "Improves precision for object/scene queries at the cost of ~1-2 s extra latency.",
+    )
 
     st.divider()
     st.subheader("Debug")
@@ -437,8 +451,8 @@ with st.sidebar:
 
 st.title("📹 Natural Language Video Search")
 st.caption(
-    "Powered by **EVA-CLIP ViT-L/14** + Qdrant · NLVS v3.0  \n"
-    "window=10 s · overlap=30% · stride=7.0 s · min\_score=0.10"
+    "Powered by **BLIP-1 ViT-B/16** + Qdrant · NLVS v3.0  \n"
+    "window=10 s · overlap=30% · stride=7.0 s · min\_score=0.20"
 )
 
 tab_camera, tab_search = st.tabs(["📷 Camera & Indexing", "🔍 Search"])
@@ -811,6 +825,7 @@ with tab_search:
                 top_k=int(top_k),
                 score_threshold=score_threshold,
                 use_templates=use_templates,
+                use_reranker=use_reranker,
             )
             elapsed = time.perf_counter() - t0
         st.session_state["_results"] = results

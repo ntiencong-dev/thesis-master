@@ -81,12 +81,22 @@ class InferenceEngine(ABC):
 
     def encode_segment_frames(self, frames_bgr: List[np.ndarray]) -> np.ndarray:
         """
-        Multi-frame averaging for one video segment.
+        Multi-frame aggregation for one video segment using soft-max pooling.
 
-        Encodes all N frames from a single window, then returns their
-        element-wise mean re-normalised to the unit sphere.  This gives
-        a single representative embedding that captures temporal context
-        better than any single frame.
+        Rationale: mean pooling dilutes brief object appearances — if only 1 of
+        5 frames shows a hair dryer, the mean embedding gets pulled toward the
+        4 non-dryer frames and the segment ranks below irrelevant segments.
+
+        Strategy — weighted average biased toward the most "extreme" frame:
+          1. Encode all N frames → (N, D) unit-sphere embeddings.
+          2. Compute per-frame magnitude of deviation from the batch mean
+             (frames with unusual content stand out more).
+          3. Apply softmax over deviations → attention weights.
+          4. Return weighted sum, re-normalised.
+
+        This preserves temporal context (no single frame wins outright) while
+        giving higher weight to frames that differ from the rest — which is
+        exactly where a distinct object like a hair dryer would appear.
 
         Parameters
         ----------
@@ -99,9 +109,21 @@ class InferenceEngine(ABC):
         if not frames_bgr:
             return np.zeros(self.embed_dim, dtype=np.float32)
 
-        embs     = self.encode_frames(frames_bgr)   # (N, D)
-        mean_emb = embs.mean(axis=0)                 # (D,)
-        norm     = np.linalg.norm(mean_emb)
+        embs = self.encode_frames(frames_bgr)   # (N, D), already L2-normalised
+
+        if len(embs) == 1:
+            return embs[0].astype(np.float32)
+
+        # Soft-max pooling: weight frames by deviation from centroid
+        centroid   = embs.mean(axis=0)                          # (D,)
+        deviations = np.linalg.norm(embs - centroid, axis=1)   # (N,)
+        # Temperature-scaled softmax (T=0.5 → moderate sharpening)
+        T       = 0.5
+        weights = np.exp(deviations / T)
+        weights = weights / weights.sum()                        # (N,)
+
+        weighted = (embs * weights[:, None]).sum(axis=0)        # (D,)
+        norm     = np.linalg.norm(weighted)
         if norm > 1e-8:
-            mean_emb = mean_emb / norm
-        return mean_emb.astype(np.float32)
+            weighted = weighted / norm
+        return weighted.astype(np.float32)

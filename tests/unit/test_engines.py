@@ -361,6 +361,7 @@ def _make_blip1_engine_mock():
     engine._model_name = "Salesforce/blip-itm-base-coco"
     engine._batch_size = 4
     engine._device     = torch.device("cpu")
+    engine._dtype      = torch.float32
     engine._processor  = MagicMock()
     engine._model      = MagicMock()
     return engine
@@ -425,8 +426,8 @@ def test_ENG35_blip1_encode_frames_shape_norm_mock():
     vision_out.last_hidden_state = torch.randn(N, 577, 768)
     engine._model.vision_model.return_value = vision_out
 
-    # image_projection: returns random tensor (will be L2-normalised)
-    engine._model.image_projection.return_value = torch.randn(N, 256)
+    # vision_proj: returns random tensor (will be L2-normalised)
+    engine._model.vision_proj.return_value = torch.randn(N, 256)
 
     frames = [np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(N)]
     out    = engine.encode_frames(frames)
@@ -457,8 +458,8 @@ def test_ENG36_blip1_encode_text_shape_norm_mock():
     text_enc_out.last_hidden_state = torch.randn(N, 10, 768)
     engine._model.text_encoder.return_value = text_enc_out
 
-    # text_projection
-    engine._model.text_projection.return_value = torch.randn(N, 256)
+    # text_proj
+    engine._model.text_proj.return_value = torch.randn(N, 256)
 
     texts = ["person running", "red car"]
     out   = engine.encode_text(texts)

@@ -127,3 +127,6 @@ This codebase is the **PC prototype** for a master's thesis on deploying a BLIP-
 | Config | `config/pc_blip1.yaml` | `config/kria_blip1.yaml` |
 
 The thesis research contribution is the INT8 quantization + Vitis AI DPU compilation of BLIP-1 ViT-B/16, and the latency/accuracy tradeoff analysis on Kria. See [DE_CUONG_LVTHS.md](DE_CUONG_LVTHS.md) for the thesis outline.
+
+
+python windows_capture_server.py --output \\wsl$\Ubuntu\home\tienc\Prototype\segments --cam 0 --seg-sec 60

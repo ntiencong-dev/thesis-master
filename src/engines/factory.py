@@ -8,12 +8,12 @@ Usage
     from src.engines.factory import create_engine
     import yaml
 
-    with open("config/pc.yaml") as f:
+    with open("config/pc_blip1.yaml") as f:
         cfg = yaml.safe_load(f)
 
     engine = create_engine(cfg)
-    # → PCEngine  (type="pc")
-    # → KriaEngine (type="kria")
+    # → BLIP1Engine (type="blip1")
+    # → KriaEngine  (type="kria")
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ def create_engine(config: dict) -> InferenceEngine:
     """
     Parameters
     ----------
-    config : dict loaded from pc.yaml or kria.yaml.
+    config : dict loaded from pc_blip1.yaml or kria_blip1.yaml.
 
     Returns
     -------

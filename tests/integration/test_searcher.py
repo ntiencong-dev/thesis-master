@@ -8,7 +8,7 @@ They are intentionally slower but exercise the full stack.
 
 Scenarios covered
 -----------------
-SR-01  from_config(pc.yaml): loads without error, engine_type=pc
+SR-01  from_config(pc_blip1.yaml): loads without error, engine_type=blip1
 SR-02  from_params(): correct window_sec, overlap, frames_per_window
 SR-03  index_video: returns segment count > 0
 SR-04  index_video: Qdrant vector count matches returned segment count
@@ -57,9 +57,9 @@ pytestmark = pytest.mark.integration
 def test_SR01_from_config_loads(real_video_path):
     import warnings; warnings.filterwarnings("ignore")
     from src.searcher import NLVideoSearcher
-    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "config", "pc.yaml")
+    config_path = os.path.join(os.path.dirname(__file__), "..", "..", "config", "pc_blip1.yaml")
     if not os.path.isfile(config_path):
-        pytest.skip("config/pc.yaml not found")
+        pytest.skip("config/pc_blip1.yaml not found")
     s = NLVideoSearcher.from_config(config_path)
     assert s is not None
     assert s._engine is not None
@@ -370,11 +370,11 @@ def test_SR28_mock_reranker_called_when_flag_true(searcher_with_real_video):
     searcher_with_real_video.set_reranker(None)
 
 
-# ── SR-29  from_config(pc.yaml) loads with qdrant backend attributes ──────
+# ── SR-29  from_config(pc_blip1.yaml) loads with qdrant backend attributes ──
 
 def test_SR29_from_config_has_qdrant_attributes():
     """
-    from_config(pc.yaml) must populate _qdrant_client/_qdrant_collection
+    from_config(pc_blip1.yaml) must populate _qdrant_client/_qdrant_collection
     attributes on NLVideoSearcher (either set or None, but always present).
     Skip if config file is missing.
     """
@@ -382,10 +382,10 @@ def test_SR29_from_config_has_qdrant_attributes():
     from src.searcher import NLVideoSearcher
 
     config_path = os.path.join(
-        os.path.dirname(__file__), "..", "..", "config", "pc.yaml"
+        os.path.dirname(__file__), "..", "..", "config", "pc_blip1.yaml"
     )
     if not os.path.isfile(config_path):
-        pytest.skip("config/pc.yaml not found")
+        pytest.skip("config/pc_blip1.yaml not found")
 
     s = NLVideoSearcher.from_config(config_path)
     assert hasattr(s, "_qdrant_client"), \
@@ -416,7 +416,7 @@ def test_SR30_qdrant_client_wired_returns_empty_list():
     mock_client = MagicMock()
     mock_client.search.return_value = []
     s._qdrant_client     = mock_client
-    s._qdrant_collection = "nlvs_segments"
+    s._qdrant_collection = "nlvs_segments_blip1"
 
     results = s.search("person", top_k=5, score_threshold=0.0)
     assert results == [], "Wired-but-empty Qdrant should return [] not raise"

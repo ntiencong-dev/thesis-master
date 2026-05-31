@@ -35,27 +35,48 @@ _QUERY_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# CLIP prompt templates — averaging their embeddings improves recall on
-# action and event queries (mirrors the ensemble strategy from the CLIP paper).
-# Phase 1: expanded from 5 → 12 templates, adding action/event and
-# surveillance-specific phrasings (RESEARCH_SOTA_NLVS.md §I3).
-_CLIP_TEMPLATES: List[str] = [
-    # General (original 5)
+# CLIP prompt templates split by query type.
+#
+# Visual (object / scene) templates — safe for ANY query; never produce
+# grammatically broken strings like "a person dryer".
+_CLIP_TEMPLATES_VISUAL: List[str] = [
     "{}",
     "a photo of {}",
     "a video frame of {}",
     "a scene with {}",
     "an image of {}",
-    # Action / event specific
-    "a person {}",
-    "someone is {}",
-    "a video of a person {}",
     "security camera footage of {}",
     "surveillance video showing {}",
-    # Scene-level
     "a scene showing {}",
     "footage of {}",
 ]
+
+# Action templates — only appended when the query describes a person action.
+# Using them on noun queries (e.g. "dryer") creates nonsensical phrases that
+# shift the query vector away from the intended concept.
+_CLIP_TEMPLATES_ACTION: List[str] = [
+    "a person {}",
+    "someone is {}",
+    "a video of a person {}",
+]
+
+# Combined list kept for backward-compat (search_debug templates_used field)
+_CLIP_TEMPLATES: List[str] = _CLIP_TEMPLATES_VISUAL + _CLIP_TEMPLATES_ACTION
+
+# Common tokens that indicate the query describes a person action/event.
+_ACTION_TOKENS: frozenset = frozenset({
+    "running", "walking", "climbing", "jumping", "carrying", "holding",
+    "fighting", "entering", "leaving", "stealing", "breaking", "opening",
+    "closing", "sitting", "standing", "lying", "falling", "pushing",
+    "pulling", "throwing", "catching", "kicking", "hitting", "waving",
+    "runs", "walks", "climbs", "jumps", "carries", "holds", "falls",
+    "person", "people", "man", "woman", "child", "someone", "somebody",
+})
+
+
+def _is_action_query(query: str) -> bool:
+    """Return True if the query describes a person action (uses action templates)."""
+    return bool(set(query.lower().split()) & _ACTION_TOKENS)
 
 
 def _normalize_query(query: str) -> str:
@@ -96,10 +117,9 @@ class SearchResult:
 class NLVideoSearcher:
     _DEFAULT: dict = {
         "backend": "pc",
-        # Phase 1: default to EVA-CLIP ViT-L/14
-        "engine":   {"type":"pc","model_name":"EVA02-L-14","pretrained":"merged2b_s4b_b131k","device":None,"batch_size":16,"frames_per_window":5},
+        "engine":   {"type":"blip1","model_name":"Salesforce/blip-itm-base-coco","device":None,"batch_size":16,"frames_per_window":5},
         "pipeline": {"video_backend":"opencv","window_sec":10.0,"overlap_ratio":0.30},
-        "index":    {"embed_dim":768,"backend":"qdrant","qdrant_url":"http://localhost:6333","qdrant_collection":"nlvs_segments"},
+        "index":    {"embed_dim":256,"backend":"qdrant","qdrant_url":"http://localhost:6333","qdrant_collection":"nlvs_segments_blip1"},
         "search":   {"top_k":5,"score_threshold":0.10,"nms_iou_threshold":0.30,
                      "adaptive_threshold":True,"translate_vi":True},
     }
@@ -139,7 +159,7 @@ class NLVideoSearcher:
         Raises RuntimeError if the collection exists with the wrong embed_dim.
         """
         url  = idx_cfg.get("qdrant_url",        "http://localhost:6333")
-        coll = idx_cfg.get("qdrant_collection", "nlvs_segments")
+        coll = idx_cfg.get("qdrant_collection", "nlvs_segments_blip1")
         dim  = idx_cfg.get("embed_dim",         self._engine.embed_dim)
         try:
             from qdrant_client import QdrantClient
@@ -233,12 +253,12 @@ class NLVideoSearcher:
     @classmethod
     def from_params(cls, use_sliding_window=True, window_sec=10.0,
                     overlap_ratio=0.30, frames_per_window=5, device=None,
-                    model_name="EVA02-L-14", pretrained="merged2b_s4b_b131k",
-                    embed_dim=768, qdrant_url="http://localhost:6333",
-                    qdrant_collection="nlvs_segments"):
+                    model_name="Salesforce/blip-itm-base-coco",
+                    embed_dim=256, qdrant_url="http://localhost:6333",
+                    qdrant_collection="nlvs_segments_blip1"):
         return cls({
             "backend": "pc",
-            "engine":  {"type":"pc","model_name":model_name,"pretrained":pretrained,
+            "engine":  {"type":"blip1","model_name":model_name,
                         "device":device,"batch_size":16,"frames_per_window":frames_per_window},
             "pipeline":{"video_backend":"opencv","window_sec":window_sec,
                         "overlap_ratio":overlap_ratio if use_sliding_window else 0.0},
@@ -397,13 +417,21 @@ class NLVideoSearcher:
 
     def _encode_with_templates(self, cleaned_query: str) -> np.ndarray:
         """
-        Encode *cleaned_query* through all CLIP prompt templates and return the
-        L2-normalised mean of the resulting embeddings.
+        Encode *cleaned_query* through relevant CLIP prompt templates and return
+        the L2-normalised mean of the resulting embeddings.
 
-        Phase 1: expanded to 12 templates (action/event + surveillance-specific)
-        covering a wider variety of visual phrasings to improve recall.
+        Template selection:
+          - Noun / object queries (e.g. "dryer", "red car"):
+              only _CLIP_TEMPLATES_VISUAL — avoids nonsensical phrases like
+              "a person dryer" that shift the query vector away from the object.
+          - Action / person queries (e.g. "person climbing fence"):
+              _CLIP_TEMPLATES_VISUAL + _CLIP_TEMPLATES_ACTION (all templates).
         """
-        texts = [t.format(cleaned_query) for t in _CLIP_TEMPLATES]
+        if _is_action_query(cleaned_query):
+            templates = _CLIP_TEMPLATES_VISUAL + _CLIP_TEMPLATES_ACTION
+        else:
+            templates = _CLIP_TEMPLATES_VISUAL
+        texts = [t.format(cleaned_query) for t in templates]
         embs  = self._engine.encode_text(texts)    # (N_templates, D)
         mean  = embs.mean(axis=0)                   # (D,)
         norm  = float(np.linalg.norm(mean))
@@ -482,6 +510,13 @@ class NLVideoSearcher:
         qvec_clean = self._engine.encode_text(cleaned)
         qvec_tmpl  = self._encode_with_templates(translated)
 
+        # Show only the templates actually used (filtered by query type)
+        _active_templates = (
+            _CLIP_TEMPLATES_VISUAL + _CLIP_TEMPLATES_ACTION
+            if _is_action_query(translated)
+            else _CLIP_TEMPLATES_VISUAL
+        )
+
         def _top(vec, k):
             rows = self._search_qdrant(vec, top_k=k)
             return [{"score": float(s), "cam_id": m.cam_id,
@@ -499,7 +534,8 @@ class NLVideoSearcher:
             "query_original":   query_text,
             "query_cleaned":    cleaned,
             "query_translated": translated,
-            "templates_used":   [t.format(translated) for t in _CLIP_TEMPLATES],
+            "query_type":       "action" if _is_action_query(translated) else "visual",
+            "templates_used":   [t.format(translated) for t in _active_templates],
             "top_raw_query":    _top(qvec_raw,   top_k),
             "top_clean_query":  _top(qvec_clean, top_k),
             "top_templates":    _top(qvec_tmpl,  top_k),
