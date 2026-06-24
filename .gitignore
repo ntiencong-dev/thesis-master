@@ -1,4 +1,53 @@
-venv
-data
-qdrant_storage
+# ── Python ──────────────────────────────────────────────
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# ── Testing / Coverage ───────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Large binary / model files ───────────────────────────
+# TorchScript export (330 MB)
+exported_models/
+# Vitis AI quantized intermediate (2.5 GB)
+quantized/
+# Compiled DPU xmodel — keep meta.json & compile_log.txt, ignore binaries
+compiled/*.xmodel
+compiled/md5sum.txt
+# Calibration numpy arrays (large)
+*.npy
+
+# ── Scripts garbage ───────────────────────────────────────
+"scripts/# Code Citations.md"
+scripts/# Code Citations.md
+
+# ── Video & media ─────────────────────────────────────────
+segments/*.mp4
+segments/job_queue.db
+segments/job_queue.db-shm
+segments/job_queue.db-wal
+data/
+
+# ── Qdrant local storage ──────────────────────────────────
+qdrant_storage/
+
+# ── Misc generated files ──────────────────────────────────
+=1.7.0
+*.log
+index_store/
+diem_nhan_y_tuong.txt
+
+# ── OS / Editor ───────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
+
 index_store
