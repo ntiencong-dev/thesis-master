@@ -1,0 +1,62 @@
+# ============================================================
+# NLVS — PC Configuration: Hướng 1 Option C
+# CLIP stage-1 (512d) + BLIP-1 ITM stage-2 reranker
+# PC: FP32 CUDA cho cả hai models — không cần AWQ trên PC
+#
+# Memory (GTX 1650 Ti, 4 GB VRAM):
+#   CLIP ViT-B/16 (open_clip CUDA):  ~300 MB VRAM
+#   BLIP-1 BERT ITM (transformers):  ~440 MB VRAM
+#   Tổng VRAM:                       ~740 MB  (feasible ✅)
+#
+# Qdrant collection: nlvs_segments (512d) — dùng chung với pc.yaml
+# Re-index không cần thiết nếu đã index với CLIP ViT-B/16 trước đó.
+# ============================================================
+
+backend: pc
+
+engine:
+  type: pc                   # CLIP via open_clip (PCEngine)
+  model_name: ViT-B-16
+  pretrained: openai
+  device: cuda               # auto-fallback to cpu
+  batch_size: 16
+  frames_per_window: 5
+
+  # AWQ paths: bỏ trống cho PC (dùng FP32 trực tiếp)
+  # awq_text_path: ~  # chỉ set cho Kria deployment
+  # awq_bert_path: ~  # chỉ set cho Kria deployment
+
+pipeline:
+  video_backend: opencv
+  window_sec: 10.0
+  overlap_ratio: 0.30
+
+index:
+  embed_dim: 512             # CLIP ViT-B/16
+  backend: qdrant
+  qdrant_url: http://localhost:6333
+  qdrant_collection: nlvs_segments   # CLIP collection (512d)
+
+capture:
+  storage_dirs:
+    - ./segments
+  segment_sec: 60
+  stride_sec: 50
+
+job_queue:
+  db_path: ./segments/job_queue.db
+
+search:
+  top_k: 5
+  score_threshold: 0.10
+  nms_iou_threshold: 0.30
+  use_itm_reranker: true      # bật BLIP-1 ITM stage-2 reranker
+  itm_top_k: 50
+  itm_alpha: 0.6
+
+  # BLIP-1 engine config cho ITM reranker (PC: load BLIP-1 riêng biệt)
+  itm_model_name: Salesforce/blip-itm-base-coco
+
+api:
+  host: 0.0.0.0
+  port: 8000

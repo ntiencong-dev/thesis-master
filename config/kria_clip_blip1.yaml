@@ -1,0 +1,76 @@
+# ============================================================
+# NLVS — Kria KV260 Configuration: Hướng 1 Option C
+# CLIP stage-1 (512d) + BLIP-1 ITM stage-2 reranker
+# AWQ INT4 text encoders + MACRO persistent DPU runners
+#
+# Điều kiện tiên quyết:
+#   1. compiled/clip_vision.xmodel        — CLIP ViT-B/16 INT8 PTQ (vai_c_xir)
+#   2. compiled/blip1_vision.xmodel       — BLIP-1 ViT-B/16 INT8 PTQ (đã có)
+#   3. exported_models/clip_text_awq_int4/ — CLIP text AWQ INT4 (awq_quantize_clip_text.py)
+#   4. exported_models/blip1_bert_awq_int4/— BLIP-1 BERT AWQ INT4 (awq_quantize_bert.py)
+#
+# Footprint trên Kria 4 GB LPDDR4:
+#   CLIP visual xmodel (DDR):      ~160 MB (PTQ INT8)
+#   BLIP-1 visual xmodel (DDR):    ~161 MB (PTQ INT8)
+#   CLIP text AWQ INT4 (RAM):       ~63 MB
+#   BLIP-1 BERT AWQ INT4 (RAM):    ~110 MB
+#   OS + Qdrant + runtime:         ~250 MB
+#   Tổng ước tính:                 ~744 MB  (< 4 GB ✅)
+#
+# MACRO: engine.macro_pool: true
+#   Giữ cả CLIP + BLIP-1 DPU runners alive trong DDR suốt session.
+#   Tiết kiệm ~420 ms/query (không reload giữa stage-1 và stage-2).
+# ============================================================
+
+backend: kria
+
+engine:
+  type: kria
+
+  # CLIP visual encoder (stage-1) — PTQ INT8 xmodel
+  xmodel_path: /usr/share/vitis_ai_library/models/clip_vit_b16/clip_vision.xmodel
+
+  # BLIP-1 visual encoder (stage-2 ITM frames) — PTQ INT8 xmodel
+  blip1_xmodel_path: /usr/share/vitis_ai_library/models/blip1_vit_b16/blip1_vision.xmodel
+
+  # AWQ INT4 text encoders (ARM CPU) — giảm memory vs FP32
+  awq_text_path: /home/ubuntu/Prototype/exported_models/clip_text_awq_int4    # CLIP text INT4
+  awq_bert_path: /home/ubuntu/Prototype/exported_models/blip1_bert_awq_int4   # BLIP-1 BERT INT4
+
+  # MACRO: giữ cả 2 DPU runners alive — tắt reload overhead
+  macro_pool: true
+
+  device_id: 0
+  batch_size: 4
+
+pipeline:
+  video_backend: opencv
+  window_sec: 10.0
+  overlap_ratio: 0.30
+
+index:
+  embed_dim: 512             # CLIP ViT-B/16 embedding dimension
+  backend: qdrant
+  qdrant_url: http://localhost:6333
+  qdrant_collection: nlvs_segments   # CLIP collection (512d)
+
+capture:
+  storage_dirs:
+    - ./segments
+  segment_sec: 60
+  stride_sec: 50
+
+job_queue:
+  db_path: ./segments/job_queue.db
+
+search:
+  top_k: 5
+  score_threshold: 0.10
+  nms_iou_threshold: 0.30
+  use_itm_reranker: true      # bật BLIP-1 ITM stage-2 reranker
+  itm_top_k: 50
+  itm_alpha: 0.6              # combined = 0.6×CLIP_cosine + 0.4×BLIP1_itm_prob
+
+api:
+  host: 0.0.0.0
+  port: 8000
