@@ -1,0 +1,69 @@
+# ============================================================
+# NLVS — PC Configuration: Hướng 1 Option B
+# CLIP stage-1 (512d) + FILIP token-level re-ranker (stage-2)
+#
+# Stage-2 dùng FILIP score:
+#   filip = mean_{text_tokens}( max_{patches}( dot(t_i, v_j) ) )
+#   combined = 0.6 × cosine + 0.4 × filip_score (normalised)
+#
+# Không cần load model thứ hai — dùng lại cùng CLIP model.
+# AWQ INT4 cho CLIP text encoder (ARM CPU, Kria deployment):
+#   awq_text_path: exported_models/clip_text_awq_int4  ← chỉ set khi deploy Kria
+#
+# Memory (GTX 1650 Ti, 4 GB VRAM):
+#   CLIP ViT-B/16 (open_clip CUDA):  ~300 MB VRAM  (shared stage-1 & 2)
+#   Tổng VRAM:                       ~300 MB  (nhẹ nhất trong các options)
+#
+# Qdrant collection: nlvs_segments (512d) — dùng chung với pc.yaml
+# ============================================================
+
+backend: pc
+
+engine:
+  type: pc                   # CLIP via open_clip (PCEngine)
+  model_name: ViT-B-16
+  pretrained: openai
+  device: cuda               # auto-fallback to cpu
+  batch_size: 16
+  frames_per_window: 5
+
+  # AWQ text path: bỏ trống cho PC (FP32 text encoder trực tiếp)
+  # Chỉ set cho Kria deployment:
+  #   awq_text_path: exported_models/clip_text_awq_int4
+
+pipeline:
+  video_backend: opencv
+  window_sec: 10.0
+  overlap_ratio: 0.30
+
+index:
+  embed_dim: 512             # CLIP ViT-B/16
+  backend: qdrant
+  qdrant_url: http://localhost:6333
+  qdrant_collection: nlvs_segments   # CLIP collection (512d)
+
+capture:
+  storage_dirs:
+    - ./segments
+  segment_sec: 60
+  stride_sec: 50
+
+job_queue:
+  db_path: ./segments/job_queue.db
+
+search:
+  top_k: 5
+  score_threshold: 0.10
+  nms_iou_threshold: 0.30
+  use_itm_reranker: false      # FILIP reranker, không phải ITM
+
+  # FILIP reranker settings
+  use_filip_reranker: true     # bật FILIPReranker (token-level CLIP matching)
+  filip_top_k: 50              # candidates passed to FILIP stage-2
+  filip_alpha: 0.6             # combined = 0.6×cosine + 0.4×filip_score
+  filip_n_frames: 5            # frames sampled per candidate segment
+  filip_normalize: true        # normalize FILIP scores to [0,1] before combining
+
+api:
+  host: 0.0.0.0
+  port: 8000

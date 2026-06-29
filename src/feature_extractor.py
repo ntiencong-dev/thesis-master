@@ -165,6 +165,158 @@ class CLIPFeatureExtractor:
         return feats.cpu().numpy().astype(np.float32)
 
     # ------------------------------------------------------------------
+    # FILIP token-level methods (for FILIPReranker)
+    # ------------------------------------------------------------------
+
+    def encode_frames_tokens(
+        self, frames_bgr: List[np.ndarray]
+    ) -> np.ndarray:
+        """
+        Extract per-patch ViT embeddings for FILIP fine-grained matching.
+
+        Hooks the ViT visual transformer at the last attention block output
+        (before the projection head) to capture the full spatial token
+        sequence.  The CLS token (index 0) is dropped; only patch tokens
+        are returned.
+
+        Parameters
+        ----------
+        frames_bgr : List of H×W×3 uint8 BGR arrays.
+
+        Returns
+        -------
+        np.ndarray  shape (N, num_patches, vit_hidden_dim), dtype float32.
+                    num_patches = 196 for ViT-B/16 (14×14 spatial grid).
+                    vit_hidden_dim = 768 (NOT the 512-d projection output).
+        """
+        if not frames_bgr:
+            return np.empty((0, 196, 768), dtype=np.float32)
+
+        all_patches: List[np.ndarray] = []
+
+        for i in range(0, len(frames_bgr), self.batch_size):
+            batch  = frames_bgr[i : i + self.batch_size]
+            tensor = self._prepare_image_batch(batch)   # (B, 3, H, W)
+
+            captured: dict = {}
+
+            def _vis_hook(module, inp, out, _cap=captured):   # type: ignore[misc]
+                # open_clip resblocks return a single tensor; HF returns tuple
+                _cap["tokens"] = out[0] if isinstance(out, tuple) else out
+
+            if _BACKEND == "open_clip":
+                # visual.transformer.resblocks[-1] — last attention block
+                last_block = self._model.visual.transformer.resblocks[-1]
+                handle     = last_block.register_forward_hook(_vis_hook)
+                with torch.no_grad():
+                    self._model.encode_image(tensor)
+                handle.remove()
+
+                tok = captured["tokens"]
+                # Some open_clip versions emit (seq_len, B, hidden);
+                # detect and permute if needed
+                if tok.dim() == 3 and tok.shape[0] != tensor.shape[0]:
+                    tok = tok.permute(1, 0, 2)   # → (B, seq_len, hidden)
+
+            else:
+                # HF CLIP: vision_model.encoder.layers[-1]
+                last_block = self._hf_model.vision_model.encoder.layers[-1]
+                handle     = last_block.register_forward_hook(_vis_hook)
+                with torch.no_grad():
+                    self._hf_model.get_image_features(pixel_values=tensor)
+                handle.remove()
+                tok = captured["tokens"]
+
+            # Drop CLS token (index 0) → patch tokens (B, num_patches, hidden)
+            patches = tok[:, 1:, :]
+            all_patches.append(patches.float().cpu().numpy())
+
+        return np.concatenate(all_patches, axis=0).astype(np.float32)
+
+    def encode_text_tokens(
+        self, texts: Union[str, List[str]]
+    ) -> tuple:
+        """
+        Extract per-token text embeddings for FILIP fine-grained matching.
+
+        Hooks the last text transformer block to capture the full sequence of
+        word-level embeddings.  Padding positions are zero-filled and
+        indicated by the returned boolean mask.
+
+        Parameters
+        ----------
+        texts : str or List[str]
+
+        Returns
+        -------
+        tokens : np.ndarray  shape (N, max_seq_len, vit_hidden_dim), float32.
+                 Padding positions are zero-filled.
+        mask   : np.ndarray  shape (N, max_seq_len), bool.
+                 True = valid token, False = padding.
+        """
+        if isinstance(texts, str):
+            texts = [texts]
+
+        all_tokens: List[np.ndarray] = []
+        all_masks:  List[np.ndarray] = []
+
+        for i in range(0, len(texts), self.batch_size):
+            batch = texts[i : i + self.batch_size]
+
+            captured: dict = {}
+
+            def _txt_hook(module, inp, out, _cap=captured):   # type: ignore[misc]
+                _cap["tokens"] = out[0] if isinstance(out, tuple) else out
+
+            if _BACKEND == "open_clip":
+                tok_ids   = self._tokenizer(batch).to(self.device)   # (B, ctx_len)
+                mask_bool = (tok_ids != 0)                           # (B, ctx_len)
+
+                last_block = self._model.transformer.resblocks[-1]
+                handle     = last_block.register_forward_hook(_txt_hook)
+                with torch.no_grad():
+                    self._model.encode_text(tok_ids)
+                handle.remove()
+
+                tok = captured["tokens"]
+                if tok.dim() == 3 and tok.shape[0] != len(batch):
+                    tok = tok.permute(1, 0, 2)   # seq-first → batch-first
+
+            else:
+                inputs    = self._hf_processor(
+                    text=batch, return_tensors="pt", padding=True,
+                )
+                inputs    = {k: v.to(self.device) for k, v in inputs.items()}
+                mask_bool = inputs["attention_mask"].bool()
+
+                enc_layers = self._hf_model.text_model.encoder.layers
+                last_block = enc_layers[-1]
+                handle     = last_block.register_forward_hook(_txt_hook)
+                with torch.no_grad():
+                    self._hf_model.get_text_features(**inputs)
+                handle.remove()
+                tok = captured["tokens"]
+
+            all_tokens.append(tok.float().cpu().numpy())
+            all_masks.append(mask_bool.cpu().numpy())
+
+        # Pad all batches to the same max sequence length
+        max_seq = max(t.shape[1] for t in all_tokens)
+        N_total = sum(t.shape[0] for t in all_tokens)
+        hidden  = all_tokens[0].shape[2]
+
+        padded_tokens = np.zeros((N_total, max_seq, hidden), dtype=np.float32)
+        padded_masks  = np.zeros((N_total, max_seq),         dtype=bool)
+        idx = 0
+        for tok, msk in zip(all_tokens, all_masks):
+            B, S, _ = tok.shape
+            padded_tokens[idx : idx + B, :S, :] = tok
+            padded_masks[ idx : idx + B, :S]    = msk
+            idx += B
+
+        return padded_tokens, padded_masks
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 

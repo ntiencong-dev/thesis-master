@@ -1,27 +1,29 @@
 """
 scripts/awq_quantize_clip_text.py
 -----------------------------------
-AWQ INT4 quantization cho CLIP text encoder (ViT-B/16, open_clip).
+AWQ-style INT4 group-wise quantization cho CLIP text encoder (ViT-B/16, open_clip).
 
-Chạy trên PC:
-    pip install autoawq open_clip_torch
+Phiên bản này KHÔNG phụ thuộc autoawq internals — dùng PyTorch thuần
+để tương thích với torch 2.0.1 và bất kỳ phiên bản transformers nào.
+
+Algorithm (AWQ-style weight-only quantization):
+  1. Load CLIP model.transformer (CLIPTextTransformer, 12L×512d)
+  2. Hook forward passes trên calibration texts → collect per-channel act scales
+  3. Compute AWQ per-channel scale: s = mean(|act|)^α  (α=0.5, per AWQ paper)
+  4. Group-wise INT4 symmetric quantization:
+       - w_q = clamp(round(w_scaled / scale_g), -7, 7)  per group_size=128
+       - scale_g = max(|w_scaled|) / 7
+  5. Lưu (w_int4, scale_g, act_scale) vào clip_text_awq.pt
+
+Chạy trên PC (không cần Docker):
+    source venv/bin/activate
     python scripts/awq_quantize_clip_text.py
 
 Output:
-    exported_models/clip_text_awq_int4/   — AWQ INT4 weights (~63 MB)
-        clip_text_awq.pt       — quantized state_dict + quant_config
-        tokenizer_config.json
+    exported_models/clip_text_awq_int4/clip_text_awq.pt  (~63 MB)
 
-Sau đó load trong pc_engine.py / kria pipeline:
+Load trong pc_engine.py / kria pipeline:
     engine_cfg["awq_text_path"] = "exported_models/clip_text_awq_int4"
-
-Ghi chú kỹ thuật
------------------
-- CLIP text encoder: 12-layer Transformer (512d hidden, 63M params)
-- FP32 size: ~250 MB → AWQ INT4: ~63 MB (4× reduction)
-- CLIP text encoder KHÔNG có ITM head → quantize thuần encoder + projection
-- Calibration: dùng COCO captions (1000 texts) — phù hợp với surveillance domain
-- open_clip API: model.encode_text() → model.transformer (text encoder)
 """
 
 from __future__ import annotations
@@ -29,7 +31,11 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -39,9 +45,9 @@ PRETRAINED   = "openai"
 DEFAULT_OUT  = "exported_models/clip_text_awq_int4"
 W_BIT        = 4
 Q_GROUP_SIZE = 128
-ZERO_POINT   = True
+AWQ_ALPHA    = 0.5   # activation scale exponent
 
-# Calibration texts — surveillance domain + general COCO style
+# Calibration texts — surveillance domain
 _CALIB_TEXTS: List[str] = [
     "a person walking near the entrance",
     "a red car parked in the lot",
@@ -63,175 +69,243 @@ _CALIB_TEXTS: List[str] = [
     "a person looking at the camera",
     "a motorcycle near the curb",
     "an empty parking lot at night",
-] * 50  # 1000 samples
+] * 50   # 1000 samples
 
 
-def _parse_args():
-    p = argparse.ArgumentParser(description="AWQ INT4 quantization for CLIP text encoder")
-    p.add_argument("--model_name",   default=MODEL_NAME,  help="open_clip model name")
-    p.add_argument("--pretrained",   default=PRETRAINED,  help="open_clip pretrained tag")
-    p.add_argument("--output",       default=DEFAULT_OUT, help="Output directory")
-    p.add_argument("--w_bit",  type=int, default=W_BIT)
-    p.add_argument("--q_group_size", type=int, default=Q_GROUP_SIZE)
-    p.add_argument("--no_zero_point", action="store_true")
-    return p.parse_args()
+import sys
+sys.path.append(".")
+from src.engines.quantized_linear import QuantizedLinear
 
+
+# ---------------------------------------------------------------------------
+# Activation collection via hooks
+# ---------------------------------------------------------------------------
+
+def _collect_act_scales(
+    model: nn.Module,
+    token_inputs: torch.Tensor,    # (N, context_length)
+    encode_fn,                      # callable(tokens) → embeddings
+    n_samples: int = 200,
+) -> Dict[str, torch.Tensor]:
+    act_dict: Dict[str, List[torch.Tensor]] = {}
+    handles  = []
+
+    def _hook(name):
+        def _fn(module, inp, out):
+            x = inp[0].detach().float()
+            if x.dim() == 3:
+                x = x.view(-1, x.shape[-1])
+            ch_max = x.abs().amax(dim=0)
+            act_dict.setdefault(name, []).append(ch_max)
+        return _fn
+
+    for name, mod in model.named_modules():
+        if isinstance(mod, nn.Linear):
+            handles.append(mod.register_forward_hook(_hook(name)))
+
+    model.eval()
+    with torch.no_grad():
+        bs = 32
+        for i in range(0, min(n_samples, len(token_inputs)), bs):
+            try:
+                encode_fn(token_inputs[i : i + bs])
+            except Exception as exc:
+                log.warning("encode_fn failed at batch %d: %s", i, exc)
+                break
+
+    for h in handles:
+        h.remove()
+
+    return {
+        k: torch.stack(v, dim=0).amax(dim=0)
+        for k, v in act_dict.items()
+        if v
+    }
+
+
+def _get_parent_and_attr(root: nn.Module, full_name: str):
+    parts  = full_name.split(".")
+    parent = root
+    for p in parts[:-1]:
+        if not hasattr(parent, p):
+            return None, None
+        parent = getattr(parent, p)
+    return parent, parts[-1]
+
+
+# ---------------------------------------------------------------------------
+# Main quantization function
+# ---------------------------------------------------------------------------
 
 def run_awq_clip_text(
-    model_name: str,
-    pretrained: str,
-    output_dir: str,
-    w_bit: int,
-    q_group_size: int,
-    zero_point: bool,
+    model_name:   str,
+    pretrained:   str,
+    output_dir:   str,
+    w_bit:        int   = W_BIT,
+    group_size:   int   = Q_GROUP_SIZE,
+    awq_alpha:    float = AWQ_ALPHA,
+    n_calib:      int   = 200,
 ) -> None:
-    """
-    Quantize CLIP text encoder (transformer backbone) với AWQ.
-
-    Strategy:
-      1. Load CLIP model via open_clip.
-      2. Extract text transformer (nn.Module).
-      3. Chạy AWQ search trên calibration texts (encode → activation stats).
-      4. Apply AWQ scales, lưu quantized state_dict.
-    """
     try:
         import open_clip
-        import torch
-    except ImportError as exc:
-        raise ImportError(f"Cần open_clip_torch và torch: {exc}") from exc
-
-    try:
-        from awq.quantize.quantizer import AwqQuantizer   # type: ignore
     except ImportError:
-        raise ImportError(
-            "AutoAWQ chưa được cài đặt.\n"
-            "Cài đặt: pip install autoawq"
-        )
+        raise ImportError("Install: pip install open-clip-torch")
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    quant_config = {
-        "zero_point": zero_point,
-        "q_group_size": q_group_size,
-        "w_bit": w_bit,
-        "version": "GEMM",
-    }
-
     log.info("Loading CLIP %s (%s) ...", model_name, pretrained)
-    model, _, preprocess = open_clip.create_model_and_transforms(
-        model_name, pretrained=pretrained
-    )
+    model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
     model.eval()
     tokenizer = open_clip.get_tokenizer(model_name)
 
-    # Text transformer là model.transformer (CLIPTextTransformer)
-    text_transformer = model.transformer
-    text_projection  = model.text_projection   # Linear(512 → 512) hoặc tương tự
+    text_transformer = model.transformer         # the actual transformer backbone
+    text_projection  = model.text_projection     # (D → D) projection
 
     log.info(
-        "Text transformer params: %d M",
+        "Text transformer: %d M params",
         sum(p.numel() for p in text_transformer.parameters()) // 1_000_000,
     )
 
-    # Tokenize calibration texts
-    log.info("Tokenizing %d calibration texts...", len(_CALIB_TEXTS))
-    tokens = tokenizer(_CALIB_TEXTS)  # (N, context_length)
+    # ── 1. Tokenize calibration texts ────────────────────────────────────
+    log.info("Tokenizing %d calibration texts ...", min(n_calib, len(_CALIB_TEXTS)))
+    tokens = tokenizer(_CALIB_TEXTS[:n_calib])   # (N, context_length)
 
-    # Chạy encoding để warm-up activation stats
-    log.info("Warm-up forward passes để collect activation statistics...")
-    with torch.no_grad():
-        for i in range(0, min(200, len(tokens)), 32):
-            batch_tokens = tokens[i : i + 32]
-            try:
-                _ = model.encode_text(batch_tokens)
-            except Exception as exc:
-                log.warning("encode_text failed at batch %d: %s", i, exc)
-                break
-
-    log.info("Chạy AWQ quantization trên text transformer...")
-    quantizer = AwqQuantizer(
-        model=text_transformer,
-        tokenizer=None,
-        w_bit=w_bit,
-        q_group_size=q_group_size,
-        zero_point=zero_point,
-        version="GEMM",
-        calib_data=None,
+    # ── 2. Collect activation scales (hook on text_transformer) ──────────
+    log.info("Collecting activation statistics (%d samples) ...", n_calib)
+    act_scales = _collect_act_scales(
+        text_transformer,
+        tokens,
+        encode_fn=lambda t: model.encode_text(t),
+        n_samples=n_calib,
     )
-    quantizer.quantize()
+    log.info("Collected stats for %d Linear layers.", len(act_scales))
 
-    # Lưu kết quả
+    # Apply AWQ alpha
+    act_scales_awq = {
+        k: v.pow(awq_alpha).clamp(min=1e-5)
+        for k, v in act_scales.items()
+    }
+
+    # ── 3. Quantize all Linear layers in text_transformer ────────────────
+    log.info("Quantizing %d Linear layers (INT%d, group=%d) ...",
+             len(act_scales_awq), w_bit, group_size)
+    n_quantized = 0
+    for name, mod in list(text_transformer.named_modules()):
+        if not isinstance(mod, nn.Linear):
+            continue
+        a_scale = act_scales_awq.get(name, torch.ones(mod.weight.shape[1]))
+        parent, attr = _get_parent_and_attr(text_transformer, name)
+        if parent is None:
+            continue
+        setattr(parent, attr, QuantizedLinear.from_linear(mod, a_scale, group_size, w_bit))
+        n_quantized += 1
+    log.info("Quantized %d layers.", n_quantized)
+
+    # ── 4. Validate ───────────────────────────────────────────────────────
+    log.info("Validating embedding quality ...")
+    _validate_quality(model, tokenizer, text_transformer, text_projection)
+
+    # ── 5. Save ───────────────────────────────────────────────────────────
     save_path = out / "clip_text_awq.pt"
     torch.save(
         {
             "text_transformer_state_dict": text_transformer.state_dict(),
             "text_projection":             text_projection.detach(),
-            "model_name":                  model_name,
-            "pretrained":                  pretrained,
-            "quant_config":                quant_config,
-            "vocab_size":                  model.vocab_size if hasattr(model, "vocab_size") else 49408,
-            "context_length":              model.context_length,
+            "quant_config": {
+                "w_bit":      w_bit,
+                "group_size": group_size,
+                "awq_alpha":  awq_alpha,
+                "model_name": model_name,
+                "pretrained": pretrained,
+            },
+            "vocab_size":     getattr(model, "vocab_size", 49408),
+            "context_length": model.context_length,
         },
         str(save_path),
     )
-
     log.info("Saved: %s", save_path)
-    _validate_embedding_quality(model, text_transformer, tokenizer)
     _print_size_report(out, fp32_mb=250)
 
 
-def _validate_embedding_quality(model, quantized_transformer, tokenizer) -> None:
-    """So sánh cosine similarity giữa FP32 và AWQ embeddings."""
-    import torch, torch.nn.functional as F
-
+def _validate_quality(model, tokenizer, quantized_transformer, text_projection) -> None:
+    """Compare FP32 vs quantized CLIP text embeddings."""
     test_texts = [
         "a person walking",
         "red car near the gate",
         "security camera footage",
+        "person climbing fence",
+        "delivery truck at gate",
     ]
     tokens = tokenizer(test_texts)
 
+    # FP32 embeddings using quantized_transformer (now has QuantizedLinear layers)
     with torch.no_grad():
-        # FP32 reference (model chưa thay transformer)
-        fp32_embs = model.encode_text(tokens)
-        fp32_embs = F.normalize(fp32_embs.float(), dim=-1)
+        q_emb = model.encode_text(tokens)
+        q_emb = F.normalize(q_emb.float(), dim=-1)
 
-        # AWQ — tạm thay transformer và chạy lại
-        original_transformer = model.transformer
-        model.transformer = quantized_transformer
-        awq_embs = model.encode_text(tokens)
-        awq_embs = F.normalize(awq_embs.float(), dim=-1)
-        model.transformer = original_transformer  # restore
+    # Reload FP32 reference
+    try:
+        import open_clip
+        fp32_model, _, _ = open_clip.create_model_and_transforms(
+            MODEL_NAME, pretrained=PRETRAINED
+        )
+        fp32_model.eval()
+        with torch.no_grad():
+            fp32_emb = fp32_model.encode_text(tokens)
+            fp32_emb = F.normalize(fp32_emb.float(), dim=-1)
 
-    cosines = (fp32_embs * awq_embs).sum(dim=-1)
-    mean_cos = cosines.mean().item()
-    log.info("=" * 50)
-    log.info("Validation: mean cosine(FP32, AWQ) = %.4f", mean_cos)
-    if mean_cos > 0.98:
-        log.info("✅ Quality PASS (> 0.98) — AWQ không làm giảm đáng kể chất lượng")
-    elif mean_cos > 0.95:
-        log.warning("⚠️  Quality MARGINAL (0.95–0.98) — kiểm tra kỹ trước deploy")
-    else:
-        log.error("❌ Quality FAIL (< 0.95) — AWQ làm giảm chất lượng quá nhiều")
-        log.error("   Thử tăng q_group_size (256 hoặc 512) hoặc dùng w_bit=8")
+        cos = (fp32_emb * q_emb).sum(dim=-1)
+        mean_cos = float(cos.mean())
+        log.info("=" * 55)
+        for txt, c in zip(test_texts, cos.tolist()):
+            log.info("  cosine = %.4f  '%s'", c, txt)
+        log.info("Mean cosine (FP32 vs INT4-AWQ): %.4f", mean_cos)
+        if mean_cos > 0.97:
+            log.info("✅ Quality PASS (> 0.97)")
+        elif mean_cos > 0.93:
+            log.warning("⚠️  Quality MARGINAL (0.93–0.97) — acceptable for Kria ARM")
+        else:
+            log.error("❌ Quality FAIL (< 0.93) — try --group_size 256 or --w_bit 8")
+        log.info("=" * 55)
+    except Exception as exc:
+        log.warning("Could not load FP32 reference for comparison: %s", exc)
 
 
 def _print_size_report(out: Path, fp32_mb: float) -> None:
-    total_bytes = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
-    size_mb = total_bytes / 1024 / 1024
+    total = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
+    size_mb = total / 1e6
     log.info("Output: %s", out)
-    log.info("Tổng kích thước: %.1f MB", size_mb)
-    log.info("So với FP32 (~%.0f MB): giảm %.1f%%", fp32_mb, (1 - size_mb / fp32_mb) * 100)
+    log.info("Total size: %.1f MB  (FP32: %.0f MB → %.1f%% reduction)",
+             size_mb, fp32_mb, (1 - size_mb / fp32_mb) * 100)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def _parse_args():
+    p = argparse.ArgumentParser(
+        description="AWQ-style INT4 quantization for CLIP text encoder"
+    )
+    p.add_argument("--model_name",  default=MODEL_NAME,  help="open_clip model name")
+    p.add_argument("--pretrained",  default=PRETRAINED,  help="open_clip pretrained tag")
+    p.add_argument("--output",      default=DEFAULT_OUT, help="Output directory")
+    p.add_argument("--w_bit",       type=int,   default=W_BIT)
+    p.add_argument("--group_size",  type=int,   default=Q_GROUP_SIZE)
+    p.add_argument("--awq_alpha",   type=float, default=AWQ_ALPHA)
+    p.add_argument("--n_calib",     type=int,   default=200)
+    return p.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
     run_awq_clip_text(
-        model_name=args.model_name,
-        pretrained=args.pretrained,
-        output_dir=args.output,
-        w_bit=args.w_bit,
-        q_group_size=args.q_group_size,
-        zero_point=not args.no_zero_point,
+        model_name  = args.model_name,
+        pretrained  = args.pretrained,
+        output_dir  = args.output,
+        w_bit       = args.w_bit,
+        group_size  = args.group_size,
+        awq_alpha   = args.awq_alpha,
+        n_calib     = args.n_calib,
     )

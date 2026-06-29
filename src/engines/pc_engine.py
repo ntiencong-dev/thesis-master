@@ -49,3 +49,27 @@ class PCEngine(InferenceEngine):
 
     def encode_text(self, texts: Union[str, List[str]]) -> np.ndarray:
         return self._extractor.encode_text(texts)
+
+    # ------------------------------------------------------------------
+    # FILIP token-level delegates (for FILIPReranker)
+    # ------------------------------------------------------------------
+
+    def encode_frames_tokens(self, frames_bgr: List[np.ndarray]) -> np.ndarray:
+        """
+        Delegate to CLIPFeatureExtractor.encode_frames_tokens().
+
+        Returns (N, num_patches, vit_hidden_dim) ViT patch embeddings.
+        See CLIPFeatureExtractor.encode_frames_tokens() for full docs.
+        """
+        return self._extractor.encode_frames_tokens(frames_bgr)
+
+    def encode_text_tokens(
+        self, texts: Union[str, List[str]]
+    ) -> tuple:
+        """
+        Delegate to CLIPFeatureExtractor.encode_text_tokens().
+
+        Returns (tokens, mask) where tokens is (N, seq_len, hidden) and
+        mask is (N, seq_len) bool.  See CLIPFeatureExtractor.encode_text_tokens().
+        """
+        return self._extractor.encode_text_tokens(texts)

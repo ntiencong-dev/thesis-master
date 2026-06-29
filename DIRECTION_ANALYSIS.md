@@ -127,49 +127,91 @@ class CLIPFrameSamplingReranker:
 
 ---
 
-### Option B: `FILIPReranker` (token-level CLIP matching, same model)
+### Option B: `FILIPReranker` (token-level CLIP matching, same model) — **Revised với AWQ + MACRO**
 
 **Cơ chế (FILIP — Fine-grained Interactive Language-Image Pre-Training):**
 ```
-Với mỗi candidate frame:
-  image_tokens = CLIP ViT intermediate patch embeddings  (196 patches × 512d)
-  text_tokens  = CLIP text encoder word embeddings       (T_len × 512d)
-  
-  filip_score  = mean_over_text_tokens(max_over_image_tokens(dot(t_i, v_j)))
-  # = "for each word, find best matching patch; average across words"
-  
+Với mỗi candidate segment:
+  frames = sample N=5 frames từ segment
+
+  [DPU / PTQ INT8]
+  image_tokens = CLIP ViT patch embeddings (196 patches × 768d hidden)
+                 → extracted via forward hook trên last ViT attention block
+                 → KHÔNG phải 512d projected CLS — là ViT hidden states thô
+
+  [ARM CPU / AWQ INT4]
+  text_tokens  = CLIP text encoder word embeddings (T_valid × 768d hidden)
+                 → extracted via forward hook trên last text transformer block
+                 → ALL token positions, không chỉ [EOS]/[CLS]
+
+  filip_score  = mean_{text tokens t_i}( max_{patches v_j}( dot(t_i, v_j) ) )
+  # = "for each word, find best matching image patch; average across words"
+
 combined = alpha × cosine_score + (1-alpha) × filip_score
 ```
 
+**Phân tích AWQ_MACRO cho Option B:**
+
+| Component | Hardware | Quantization | Lý do |
+|---|---|---|---|
+| CLIP visual encoder (ITC [CLS]) | **DPU B4096** | **PTQ INT8** (giữ nguyên) | DPU chỉ nhận `.xmodel` |
+| CLIP visual encoder (FILIP patches) | **DPU B4096** | **PTQ INT8** (xmodel MỚI) | Cần xmodel expose patch tokens |
+| CLIP text encoder (ITC [EOS]) | **ARM Cortex-A53** | **AWQ INT4** | Giảm 250 MB → 63 MB |
+| CLIP text encoder (FILIP all tokens) | **ARM Cortex-A53** | **AWQ INT4** (cùng model) | AWQ giữ nguyên per-token quality |
+| MACRO (2 CLIP xmodels) | Kria DPU | **MACRO optional** | Tránh ~300 ms reload/query |
+
+**AWQ INT4 cho CLIP text encoder trong Option B:**
+- Cùng `exported_models/clip_text_awq_int4/` như Option C — có thể tái sử dụng.
+- FILIPReranker cần **all T token positions** từ last text transformer block.
+- `scripts/awq_validate_filip_tokens.py` (mới) kiểm tra per-token cosine > 0.95
+  và FILIP rank correlation (Spearman) > 0.90 để đảm bảo AWQ không làm hỏng
+  fine-grained matching.
+
+**Điều chỉnh kỹ thuật quan trọng — patch embed dim:**
+- ViT-B/16 patch tokens có hidden dim = **768** (ViT hidden size), KHÔNG phải 512d.
+- 512d là output của projection head (sau `visual.ln_post` + `visual.proj`) — dùng cho ITC.
+- FILIP dùng **pre-projection** hidden states → 768d; dot-product với text tokens 768d.
+- `encode_frames_tokens()` drops CLS (index 0) → trả về `(N, 196, 768)`.
+- `encode_text_tokens()` trả về `(tokens, mask)` shape `(N, T, 768)` + bool mask.
+
 **Pros:**
 - True fine-grained matching: biết "hair dryer" khớp với patch góc phải, không phải toàn frame.
-- Dùng cùng CLIP model — không load thêm.
+- Dùng cùng CLIP model — không load thêm model mới.
 - Phù hợp với branch name `v1.0.3_clip_FILIP_reranker`.
-- Về lý thuyết recall tốt hơn Option A khi object nhỏ/brief.
+- Recall tốt hơn Option A khi object nhỏ/xuất hiện ngắn.
+- **[MỚI] AWQ INT4 text encoder**: 250 MB FP32 → ~63 MB — viable trên Kria.
+- **[MỚI] MACRO optional**: nếu dùng 2 CLIP xmodels, MACRO tiết kiệm ~300 ms/query.
 
 **Cons:**
-- **Breaking change**: cần thêm `encode_frames_tokens()` vào `PCEngine` / `CLIPFeatureExtractor`
-  để expose patch-level tokens từ ViT, không chỉ [CLS] token.
-- Không expose trực tiếp qua `InferenceEngine` ABC hiện tại.
-- Kria: DPU chỉ nhận final xmodel output — cần export xmodel mới giữ intermediate features.
-- 2–4× slower hơn Option A do process nhiều tokens hơn.
+- **Blocker Kria**: cần export xmodel CLIP mới giữ patch tokens (trước projection head).
+  Xmodel hiện tại `clip_itc.xmodel` chỉ export [CLS] embedding — không tái dụng được.
+- Trên PC: forward hook hoạt động ngay, không cần xmodel mới.
+- 2–4× slower hơn Option A do xử lý 196 patches × T tokens.
+- AWQ không áp dụng cho visual side (DPU) — chỉ text encoder (ARM CPU).
 
-**Interface changes needed:**
+**Implementation status (đã hoàn thành trên PC):**
 ```python
-# base_engine.py: thêm optional method
-def encode_frames_tokens(self, frames_bgr) -> np.ndarray:
-    """Returns (N, num_patches, embed_dim) patch token embeddings."""
-    raise NotImplementedError
+# ✅ src/feature_extractor.py — CLIPFeatureExtractor:
+def encode_frames_tokens(frames_bgr) -> np.ndarray:   # (N, 196, 768)
+    # Forward hook on visual.transformer.resblocks[-1]
+    ...
+def encode_text_tokens(texts) -> tuple:               # (tokens, mask)
+    # Forward hook on transformer.resblocks[-1]
+    # tokens: (N, T, 768) — ALL token positions
+    # mask:   (N, T) bool — True = valid, False = padding
+    ...
 
-# feature_extractor.py: expose ViT patch tokens
-class CLIPFeatureExtractor:
-    def encode_frames_tokens(self, frames_bgr) -> np.ndarray:
-        # Hook vào ViT intermediate layer (penultimate, trước projection)
-        ...
+# ✅ src/engines/pc_engine.py — PCEngine:
+def encode_frames_tokens(frames_bgr) -> np.ndarray: ...
+def encode_text_tokens(texts) -> tuple: ...
 
-# pc_engine.py: delegate to extractor
-def encode_frames_tokens(self, frames_bgr) -> np.ndarray:
-    return self._extractor.encode_frames_tokens(frames_bgr)
+# ✅ src/reranker_filip.py — FILIPReranker:
+#   filip_score = mean_{t_i}( max_{v_j}( dot(t_i, v_j) ) )
+#   normalize_filip=True: FILIP scores → [0,1] trước khi combine
+#   Same interface as BLIP1ITMReranker → drop-in với set_reranker()
+
+# ✅ scripts/awq_validate_filip_tokens.py:
+#   Kiểm tra AWQ per-token cosine > 0.95, FILIP rank corr > 0.90
 ```
 
 ---
@@ -321,20 +363,23 @@ Ngoài ra, với MACRO, cả 2 AWQ models (CLIP text + BLIP-1 BERT) cũng đư�
 
 ## 4. So sánh tổng hợp
 
-| Tiêu chí | Option A (Frame Sampling) | Option B (FILIP Token) | Option C (Dual Model + AWQ + MACRO) |
+| Tiêu chí | Option A (Frame Sampling) | Option B (FILIP Token + AWQ) | Option C (Dual Model + AWQ + MACRO) |
 |---|---|---|---|
 | Model load thêm | Không | Không | BLIP-1 BERT AWQ (~110 MB) |
-| Interface changes | Không | Cần `encode_frames_tokens()` | Thêm `MacroRunnerPool` |
-| Kria-compatible | ✅ Trực tiếp | ⚠️ Cần xmodel mới | ✅ **Khả thi sau AWQ** (~494 MB tổng) |
-| Precision improvement | Trung bình | Cao | **Cao nhất** (BERT cross-attention) |
+| Interface changes | Không | ✅ **Đã implement** (`encode_frames_tokens`, `encode_text_tokens`) | Thêm `MacroRunnerPool` |
+| Kria-compatible | ✅ Trực tiếp | ⚠️ **Cần CLIP FILIP xmodel mới** | ✅ **Khả thi sau AWQ** (~494 MB tổng) |
+| Precision improvement | Trung bình | Cao (token-level alignment) | **Cao nhất** (BERT cross-attention) |
 | Latency stage-2 (PC, GPU) | ~30 ms/cand | ~80 ms/cand | ~46 ms/cand |
 | Latency stage-2 (Kria ARM) | ~20 ms/cand | ⚠️ ~120 ms/cand | ~46 ms/cand |
-| Memory (Kria LPDDR4) | ~160 MB | ~160 MB | **~494 MB** (với AWQ) |
+| Memory (Kria LPDDR4) | ~160 MB | **~223 MB** (PTQ 160 + AWQ 63) | **~494 MB** (với AWQ) |
 | Complexity | Thấp | Cao | Trung bình |
-| Quantization | PTQ INT8 (DPU) | PTQ INT8 (DPU) | **PTQ INT8 (DPU) + AWQ INT4 (CPU)** |
-| MACRO benefit | Không cần | Không cần | **Cần thiết** (~420 ms saved/query) |
+| Quantization (visual) | PTQ INT8 (DPU) | PTQ INT8 (DPU, xmodel mới) | PTQ INT8 (DPU) |
+| Quantization (text) | N/A | **AWQ INT4 (ARM CPU)** ← MỚI | **AWQ INT4 (ARM CPU)** |
+| MACRO benefit | Không cần | **Optional** (~300 ms saved nếu 2 CLIP xmodels) | **Cần thiết** (~420 ms saved/query) |
+| AWQ text encoder | N/A | ✅ Reuse `clip_text_awq_int4/` | ✅ `clip_text_awq_int4/` + `blip1_bert_awq_int4/` |
 | Branch name aligned | Một phần | ✅ FILIP = branch name | Không |
-| Implementation effort | 1 ngày | 3–5 ngày | **2–3 ngày** |
+| Implementation effort (PC) | 1 ngày | ✅ **Đã xong** (3 files) | 2–3 ngày |
+| Implementation effort (Kria) | 0 ngày | **3–5 ngày** (xmodel mới) | 2–3 ngày |
 
 ---
 
@@ -409,10 +454,23 @@ Phase D:             Thesis writeup: compare Hướng 1 Option C vs Hướng 2
 
 ## 7. Files cần thay đổi
 
+### Option B (FILIP + AWQ) — đã hoàn thành (PC side)
+
+| File | Trạng thái | Nội dung |
+|---|---|---|
+| `src/feature_extractor.py` | ✅ **Xong** | `encode_frames_tokens()` → `(N,196,768)` patch tokens via ViT hook; `encode_text_tokens()` → `(tokens,mask)` word-level tokens via text transformer hook |
+| `src/engines/pc_engine.py` | ✅ **Xong** | Delegate `encode_frames_tokens()` và `encode_text_tokens()` sang extractor |
+| `src/reranker_filip.py` | ✅ **Xong (Mới)** | `FILIPReranker`: FILIP score + normalize + combine; same interface as `BLIP1ITMReranker` |
+| `scripts/awq_validate_filip_tokens.py` | ✅ **Xong (Mới)** | Validate AWQ per-token cosine > 0.95, FILIP rank correlation (Spearman) > 0.90 |
+| `scripts/export_clip_filip_xmodel.py` | ⏳ **Kria only** | Export CLIP xmodel với patch-level output (stop before projection head) — Vitis AI work |
+| `config/pc_clip_filip.yaml` | ⏳ Chưa có | PC config: CLIP stage-1 + FILIP reranker, AWQ text path |
+
+### Option C (Dual Model + AWQ + MACRO) — còn thiếu
+
 | File | Loại thay đổi | Nội dung |
 |---|---|---|
-| `scripts/awq_quantize_bert.py` | **Mới** | AutoAWQ INT4 cho BLIP-1 BERT text + ITM encoder |
-| `scripts/awq_quantize_clip_text.py` | **Mới** | AutoAWQ INT4 cho CLIP text encoder |
+| `scripts/awq_quantize_bert.py` | ✅ **Mới (có sẵn)** | AutoAWQ INT4 cho BLIP-1 BERT text + ITM encoder |
+| `scripts/awq_quantize_clip_text.py` | ✅ **Mới (có sẵn)** | AutoAWQ INT4 cho CLIP text encoder |
 | `src/engines/kria_engine.py` | Sửa | Thêm `MacroRunnerPool`, persistent runners, load AWQ text |
 | `src/engines/blip1_engine.py` | Sửa | Hỗ trợ `awq_bert_path` config để load AWQ INT4 BERT |
 | `src/engines/factory.py` | Sửa | Hỗ trợ `engine.type: clip_blip1` (dual model) |
@@ -427,20 +485,32 @@ Phase D:             Thesis writeup: compare Hướng 1 Option C vs Hướng 2
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Quyết định 1: Quantization Strategy                            │
-│    DPU (visual encoders) : PTQ INT8 via vai_q_pytorch — giữ nguyên │
-│    ARM CPU (text encoders): AWQ INT4 via AutoAWQ  — THAY ĐỔI    │
-│    Lý do: DPU B4096 chỉ nhận INT8; ARM CPU hỗ trợ INT4 kernels  │
-│    Kết quả: ~494 MB tổng (từ ~1.37 GB FP32)                     │
+│  Quyết định 1: Quantization Strategy (áp dụng cho TẤT CẢ options) │
+│    DPU (visual encoders) : PTQ INT8 via vai_q_pytorch — bất biến  │
+│    ARM CPU (text encoders): AWQ INT4 via AutoAWQ  — áp dụng       │
+│    Lý do: DPU B4096 chỉ nhận INT8; ARM hỗ trợ INT4 gemm kernels  │
+│                                                                   │
+│    Option B: AWQ áp dụng cho CLIP text encoder (~63 MB)           │
+│    Option C: AWQ áp dụng cho CLIP text + BLIP-1 BERT (~63+110 MB) │
 ├─────────────────────────────────────────────────────────────────┤
 │  Quyết định 2: MACRO — Persistent DPU Runners                    │
-│    Giữ CLIP + BLIP-1 DPU runners alive trong DDR suốt session    │
-│    + Preload AWQ text models vào RAM khi server start             │
-│    Kết quả: ~420 ms tiết kiệm mỗi query (không reload overhead)  │
+│    Option B: MACRO optional — 2 CLIP xmodels (ITC + FILIP)        │
+│              Nếu dùng 1 xmodel: MACRO không cần                  │
+│              Saving: ~300 ms/query (2-xmodel case)               │
+│    Option C: MACRO cần thiết — CLIP xmodel + BLIP-1 xmodel        │
+│              Saving: ~420 ms/query (must-have)                   │
 ├─────────────────────────────────────────────────────────────────┤
-│  Quyết định 3: Chọn Option C cho Hướng 1                        │
+│  Quyết định 3: Chọn Option C cho Hướng 1 (khuyến nghị chính)    │
 │    CLIP (512d) stage-1 + BLIP-1 ITM stage-2 (đã có code)        │
 │    AWQ làm cho Option C viable trên Kria 4 GB LPDDR4             │
 │    MACRO làm cho dual-model latency acceptable (~2360 ms/query)  │
+├─────────────────────────────────────────────────────────────────┤
+│  [MỚI] Option B PC implementation (đã hoàn thành):              │
+│    src/reranker_filip.py          — FILIPReranker class           │
+│    src/feature_extractor.py       — encode_frames_tokens()        │
+│                                     encode_text_tokens()          │
+│    src/engines/pc_engine.py       — delegate methods              │
+│    scripts/awq_validate_filip_tokens.py — per-token AWQ check     │
+│    Kria blocker: cần CLIP FILIP xmodel (patch-level output)      │
 └─────────────────────────────────────────────────────────────────┘
 ```

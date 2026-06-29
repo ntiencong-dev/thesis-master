@@ -103,10 +103,69 @@ class BLIP1Engine(InferenceEngine):
         )
         self._model.eval()
 
+        # ── AWQ INT4 text encoder (optional) ─────────────────────────────
+        # When awq_bert_path is set (Kria deployment), replace the FP32 text
+        # encoder with the AWQ INT4 variant to reduce ARM memory footprint
+        # from ~440 MB → ~110 MB.  Visual encoder and ITM head are unchanged.
+        self._awq_bert_path: str = config.get("awq_bert_path", "")
+        if self._awq_bert_path:
+            self._load_awq_bert(self._awq_bert_path)
+
         logger.info(
-            "[BLIP1Engine] Ready — embed_dim=%d device=%s",
+            "[BLIP1Engine] Ready — embed_dim=%d device=%s awq_bert=%s",
             self.EMBED_DIM_VALUE, self._device,
+            "enabled" if self._awq_bert_path else "disabled",
         )
+
+    def _load_awq_bert(self, awq_path: str) -> None:
+        """
+        Replace BLIP-1 text_encoder weights with AWQ INT4 quantized version.
+
+        The checkpoint saved by scripts/awq_quantize_bert.py stores either:
+          a) AutoAWQ format: full quantized model (auto-detected)
+          b) Custom format: {"text_encoder_state_dict": ..., "text_proj_state_dict": ...}
+
+        Only the text encoder weights are swapped — vision_model, itm_head,
+        and the processor remain the FP32 originals.
+        """
+        import os
+        import torch
+
+        pt_file = os.path.join(awq_path, "blip1_text_awq.pt")
+        if os.path.isfile(pt_file):
+            # Custom AWQ format (from _run_custom_awq in awq_quantize_bert.py)
+            logger.info("[BLIP1Engine] Loading AWQ BERT from: %s", pt_file)
+            ckpt = torch.load(pt_file, map_location=self._device, weights_only=False)
+            try:
+                from .quantized_linear import replace_with_quantized_linear
+                replace_with_quantized_linear(self._model.text_encoder, ckpt["text_encoder_state_dict"])
+                self._model.text_encoder.load_state_dict(
+                    ckpt["text_encoder_state_dict"], strict=False
+                )
+                if "text_proj_state_dict" in ckpt and ckpt["text_proj_state_dict"] is not None:
+                    self._model.text_proj.load_state_dict(
+                        ckpt["text_proj_state_dict"], strict=False
+                    )
+                logger.info("[BLIP1Engine] AWQ BERT loaded — text encoder quantized INT4")
+            except Exception as exc:
+                logger.warning(
+                    "[BLIP1Engine] AWQ BERT load failed (%s), using FP32 text encoder", exc
+                )
+        else:
+            # AutoAWQ format: full quantized model directory
+            try:
+                from awq import AutoAWQForCausalLM  # type: ignore
+                from transformers import AutoTokenizer
+                logger.info("[BLIP1Engine] Loading AutoAWQ BERT from: %s", awq_path)
+                awq_model = AutoAWQForCausalLM.from_quantized(awq_path, fuse_layers=False)
+                # Replace only text encoder, keeping vision model + ITM head intact
+                if hasattr(awq_model, "model") and hasattr(awq_model.model, "encoder"):
+                    self._model.text_encoder = awq_model.model.to(self._device)
+                logger.info("[BLIP1Engine] AutoAWQ BERT loaded successfully")
+            except Exception as exc:
+                logger.warning(
+                    "[BLIP1Engine] AutoAWQ BERT load failed (%s), using FP32 fallback", exc
+                )
 
     # ------------------------------------------------------------------
     # InferenceEngine ABC

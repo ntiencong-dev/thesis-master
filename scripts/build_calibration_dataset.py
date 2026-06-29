@@ -141,28 +141,87 @@ def build_dataset(segments_dir: Path, n_frames: int, output_dir: Path) -> Path:
     log.info("  Saved:   %s", out_path)
     log.info("")
     log.info("Next step (inside Vitis AI Docker):")
-    log.info("  python scripts/quantize_blip1.py")
+    log.info("  python scripts/quantize_blip1.py    # for BLIP-1 visual")
+    log.info("  python scripts/quantize_clip_visual.py  # for CLIP visual")
 
+    return out_path
+
+
+def build_clip_dataset(segments_dir: Path, n_frames: int, output_dir: Path) -> Path:
+    """
+    Build calibration dataset for CLIP ViT-B/16 (224×224, CLIP normalisation).
+
+    Output: exported_models/calibration_frames_clip.npy
+      shape: (N, 3, 224, 224), dtype=float32
+    """
+    import numpy as np
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    video_files = sorted(segments_dir.glob("**/*.mp4"))
+    if not video_files:
+        raise FileNotFoundError(f"No .mp4 files found in {segments_dir}")
+
+    per_video = max(1, n_frames // len(video_files))
+    all_bgr: list[np.ndarray] = []
+    for vpath in video_files:
+        frames = sample_frames_from_video(vpath, per_video)
+        log.info("  %s → %d frames sampled (CLIP)", vpath.name, len(frames))
+        all_bgr.extend(frames)
+
+    import random
+    random.shuffle(all_bgr)
+    all_bgr = all_bgr[:n_frames]
+
+    # CLIP normalisation: resize 224, RGB, mean/std
+    log.info("Preprocessing for CLIP (224×224, CLIP mean/std) ...")
+    MEAN = np.array([0.48145466, 0.4578275,  0.40821073], dtype=np.float32)
+    STD  = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32)
+    tensors = []
+    for bgr in all_bgr:
+        rgb  = cv2.resize(bgr[:, :, ::-1], (224, 224)).astype(np.float32) / 255.0
+        norm = (rgb - MEAN) / STD                    # (224, 224, 3)
+        tensors.append(norm.transpose(2, 0, 1))      # (3, 224, 224)
+
+    arr = np.stack(tensors).astype(np.float32)
+    out_path = output_dir / "calibration_frames_clip.npy"
+    np.save(str(out_path), arr)
+    size_mb = out_path.stat().st_size / 1e6
+    log.info("CLIP calibration saved: %s  (%.1f MB)", out_path, size_mb)
+    log.info("Shape: %s", arr.shape)
     return out_path
 
 
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Build BLIP-1 PTQ calibration dataset")
+    p = argparse.ArgumentParser(description="Build PTQ calibration dataset (BLIP-1 and/or CLIP)")
     p.add_argument("--segments-dir", default=str(DEFAULT_DIR),
                    help=f"Directory containing .mp4 segment files (default: {DEFAULT_DIR})")
     p.add_argument("--n-frames", type=int, default=N_FRAMES,
                    help=f"Number of calibration frames to collect (default: {N_FRAMES})")
     p.add_argument("--output-dir", default=str(OUTPUT_DIR),
                    help=f"Output directory (default: {OUTPUT_DIR})")
+    p.add_argument(
+        "--model",
+        choices=["blip1", "clip", "all"],
+        default="all",
+        help=(
+            "blip1: only build BLIP-1 calibration (384×384, BlipProcessor)\n"
+            "clip:  only build CLIP calibration (224×224, CLIP normalize)\n"
+            "all:   build both (default)"
+        ),
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    build_dataset(
-        segments_dir=Path(args.segments_dir),
-        n_frames=args.n_frames,
-        output_dir=Path(args.output_dir),
-    )
+    seg  = Path(args.segments_dir)
+    out  = Path(args.output_dir)
+    n    = args.n_frames
+
+    if args.model in ("blip1", "all"):
+        build_dataset(seg, n, out)
+    if args.model in ("clip", "all"):
+        build_clip_dataset(seg, n, out)

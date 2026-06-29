@@ -676,3 +676,220 @@ def test_ITM11_absolute_fields_forwarded():
     r = result[0]
     assert r.absolute_start == 205.0, f"Expected 205.0, got {r.absolute_start}"
     assert r.absolute_end   == 210.0, f"Expected 210.0, got {r.absolute_end}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# FILIPReranker unit tests  (FILIP-01 .. FILIP-06)
+# Option B: token-level CLIP matching re-ranker
+# All mock-based — no model loading, no disk I/O
+# ══════════════════════════════════════════════════════════════════════════
+
+def _make_filip_engine(n_patches: int = 196, hidden: int = 768, n_text: int = 5):
+    """Return a mock engine with encode_frames_tokens / encode_text_tokens."""
+    mock_engine = MagicMock()
+    # encode_frames_tokens returns (N_frames, n_patches, hidden)
+    mock_engine.encode_frames_tokens.return_value = np.random.randn(
+        3, n_patches, hidden
+    ).astype(np.float32)
+    # encode_text_tokens returns (tokens, mask)
+    tokens = np.random.randn(1, n_text, hidden).astype(np.float32)
+    mask   = np.ones((1, n_text), dtype=bool)
+    mock_engine.encode_text_tokens.return_value = (tokens, mask)
+    return mock_engine
+
+
+def _make_filip_reranker(**kwargs):
+    from src.reranker_filip import FILIPReranker
+    engine = kwargs.pop("engine", _make_filip_engine())
+    r = FILIPReranker(engine=engine, **kwargs)
+    # Bypass video I/O
+    r._sample_frames = lambda path, t0, t1: [
+        np.zeros((224, 224, 3), dtype=np.uint8) for _ in range(3)
+    ]
+    return r, engine
+
+
+# ── FILIP-01  importable ──────────────────────────────────────────────────
+
+@pytest.mark.unit
+def test_FILIP01_reranker_importable():
+    """FILIPReranker must be importable and require token-capable engine."""
+    from src.reranker_filip import FILIPReranker
+    assert callable(FILIPReranker)
+
+
+# ── FILIP-02  raises on engine without token methods ─────────────────────
+
+@pytest.mark.unit
+def test_FILIP02_raises_on_missing_token_methods():
+    """FILIPReranker must raise AttributeError for engine without token API."""
+    from src.reranker_filip import FILIPReranker
+    bad_engine = MagicMock(spec=[])   # no attributes at all
+    with pytest.raises(AttributeError):
+        FILIPReranker(engine=bad_engine)
+
+
+# ── FILIP-03  empty candidates → [] ──────────────────────────────────────
+
+@pytest.mark.unit
+def test_FILIP03_empty_candidates_returns_empty():
+    """FILIPReranker.rerank([]) must return []."""
+    r, _ = _make_filip_reranker()
+    assert r.rerank([], "query") == []
+
+
+# ── FILIP-04  output length and rank sequential ───────────────────────────
+
+@pytest.mark.unit
+def test_FILIP04_output_length_and_rank():
+    """FILIPReranker must return N results with sequential rank starting at 1."""
+    N = 4
+    r, eng = _make_filip_reranker()
+    # Provide different filip scores per candidate via mock
+    eng.encode_frames_tokens.return_value = np.random.randn(3, 196, 768).astype(np.float32)
+
+    cands = _make_itm_candidates(N)
+    result = r.rerank(cands, "person walking")
+
+    assert len(result) == N
+    assert [res.rank for res in result] == list(range(1, N + 1))
+
+
+# ── FILIP-05  top_k respected ─────────────────────────────────────────────
+
+@pytest.mark.unit
+def test_FILIP05_top_k_respected():
+    """FILIPReranker must truncate to top_k."""
+    N, K = 5, 2
+    r, _ = _make_filip_reranker()
+    result = r.rerank(_make_itm_candidates(N), "query", top_k=K)
+    assert len(result) == K
+
+
+# ── FILIP-06  combined score formula ─────────────────────────────────────
+
+@pytest.mark.unit
+def test_FILIP06_combined_score_within_bounds():
+    """combined = alpha * cosine + (1-alpha) * filip must be in reasonable range."""
+    alpha = 0.6
+    r, _ = _make_filip_reranker(alpha=alpha, normalize_filip=True)
+
+    cands = _make_itm_candidates(3)
+    result = r.rerank(cands, "query")
+
+    for res in result:
+        # cosine scores are ~0.7–0.9, filip normalised to [0,1]
+        # combined must stay in (0, 1.5) range
+        assert 0.0 <= res.score <= 1.5, f"combined score out of range: {res.score}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Dual-model (Option C) config wiring tests  (DUAL-01 .. DUAL-04)
+# ══════════════════════════════════════════════════════════════════════════
+
+# ── DUAL-01  _init_reranker_from_config attaches BLIP1ITMReranker ─────────
+
+@pytest.mark.unit
+def test_DUAL01_config_wires_blip1_itm_reranker():
+    """
+    NLVideoSearcher._init_reranker_from_config() must attach BLIP1ITMReranker
+    when search.use_itm_reranker=true and engine is blip1.
+    """
+    from src.searcher import NLVideoSearcher
+    from src.reranker import BLIP1ITMReranker
+
+    # Build a minimal config-like dict
+    config = {
+        "engine":   {"type": "blip1", "model_name": "Salesforce/blip-itm-base-coco",
+                     "device": "cpu", "batch_size": 1},
+        "pipeline": {"video_backend": "opencv", "window_sec": 5.0, "overlap_ratio": 0.0},
+        "index":    {"embed_dim": 256, "backend": "qdrant",
+                     "qdrant_url": "http://localhost:6333",
+                     "qdrant_collection": "nlvs_test_dual"},
+        "search":   {"top_k": 3, "score_threshold": 0.0, "nms_iou_threshold": 0.5,
+                     "use_itm_reranker": True, "itm_alpha": 0.6,
+                     "adaptive_threshold": False, "translate_vi": False},
+    }
+
+    try:
+        s = NLVideoSearcher(config)
+    except Exception:
+        pytest.skip("Cannot instantiate NLVideoSearcher (Qdrant/model unavailable)")
+
+    assert s._reranker is not None, "Reranker should be auto-attached"
+    assert isinstance(s._reranker, BLIP1ITMReranker), \
+        f"Expected BLIP1ITMReranker, got {type(s._reranker)}"
+
+
+# ── DUAL-02  _init_reranker_from_config attaches FILIPReranker ────────────
+
+@pytest.mark.unit
+def test_DUAL02_config_wires_filip_reranker():
+    """
+    NLVideoSearcher._init_reranker_from_config() must attach FILIPReranker
+    when search.use_filip_reranker=true and engine is pc (PCEngine).
+    """
+    from src.searcher import NLVideoSearcher
+    from src.reranker_filip import FILIPReranker
+
+    config = {
+        "engine":   {"type": "pc", "model_name": "ViT-B-16", "pretrained": "openai",
+                     "device": "cpu", "batch_size": 1},
+        "pipeline": {"video_backend": "opencv", "window_sec": 5.0, "overlap_ratio": 0.0},
+        "index":    {"embed_dim": 512, "backend": "qdrant",
+                     "qdrant_url": "http://localhost:6333",
+                     "qdrant_collection": "nlvs_test_filip"},
+        "search":   {"top_k": 3, "score_threshold": 0.0, "nms_iou_threshold": 0.5,
+                     "use_filip_reranker": True, "filip_alpha": 0.6, "filip_n_frames": 3,
+                     "adaptive_threshold": False, "translate_vi": False},
+    }
+
+    try:
+        s = NLVideoSearcher(config)
+    except Exception:
+        pytest.skip("Cannot instantiate NLVideoSearcher (Qdrant/model unavailable)")
+
+    assert s._reranker is not None, "FILIPReranker should be auto-attached"
+    assert isinstance(s._reranker, FILIPReranker), \
+        f"Expected FILIPReranker, got {type(s._reranker)}"
+
+
+# ── DUAL-03  set_reranker overrides config-attached reranker ──────────────
+
+@pytest.mark.unit
+def test_DUAL03_set_reranker_overrides_auto_attach():
+    """set_reranker() must override any previously auto-attached reranker."""
+    from src.searcher import NLVideoSearcher
+
+    # Directly call _init_reranker_from_config logic without full init
+    # by using a mock searcher
+    mock_searcher = MagicMock(spec=NLVideoSearcher)
+    mock_searcher._reranker = None
+    mock_searcher._engine   = MagicMock()
+    mock_searcher._config   = {}
+
+    sentinel = object()
+    NLVideoSearcher.set_reranker(mock_searcher, sentinel)
+    assert mock_searcher._reranker is sentinel
+
+
+# ── DUAL-04  use_itm_reranker false → no reranker attached ────────────────
+
+@pytest.mark.unit
+def test_DUAL04_no_reranker_when_config_disabled():
+    """
+    When use_itm_reranker=false and use_filip_reranker=false,
+    _init_reranker_from_config() must leave _reranker as None.
+    """
+    from src.searcher import NLVideoSearcher
+
+    mock_searcher = MagicMock(spec=NLVideoSearcher)
+    mock_searcher._reranker = None
+    mock_searcher._engine   = MagicMock()
+
+    # Call the actual method (not mocked)
+    NLVideoSearcher._init_reranker_from_config(
+        mock_searcher,
+        {"search": {"use_itm_reranker": False, "use_filip_reranker": False}},
+    )
+    assert mock_searcher._reranker is None

@@ -285,6 +285,8 @@ class KriaEngine(InferenceEngine):
                 awq_data.get("model_name", "ViT-B-16"),
                 pretrained=awq_data.get("pretrained", "openai"),
             )
+            from .quantized_linear import replace_with_quantized_linear
+            replace_with_quantized_linear(model.transformer, awq_data["text_transformer_state_dict"])
             model.transformer.load_state_dict(awq_data["text_transformer_state_dict"])
             model.text_projection = awq_data["text_projection"]
             model.eval()

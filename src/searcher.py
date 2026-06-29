@@ -145,8 +145,9 @@ class NLVideoSearcher:
         self._adaptive_threshold = s.get("adaptive_threshold", True)
         self._translate_vi       = s.get("translate_vi",       True)
 
-        # Phase 3: optional BLIP-2 reranker (None by default)
+        # Phase 3: optional reranker — auto-attach from config if enabled
         self._reranker = None
+        self._init_reranker_from_config(self._config)
 
     # ------------------------------------------------------------------
     # Qdrant backend helpers
@@ -245,6 +246,55 @@ class NLVideoSearcher:
                 },
             )],
         )
+
+    def _init_reranker_from_config(self, config: dict) -> None:
+        """
+        Auto-attach a reranker from config so callers don't need to wire it manually.
+
+        Priority:
+          1. search.use_itm_reranker: true  → BLIP1ITMReranker (Option C)
+             - Engine must be 'blip1' or 'clip_blip1' (has ._blip1_engine)
+          2. search.use_filip_reranker: true → FILIPReranker (Option B)
+             - Engine must be 'pc' or 'kria' (has encode_frames_tokens)
+        """
+        s = config.get("search", {})
+        use_itm   = s.get("use_itm_reranker",   False)
+        use_filip = s.get("use_filip_reranker",  False)
+
+        if use_itm:
+            try:
+                from .reranker import BLIP1ITMReranker
+                alpha  = float(s.get("itm_alpha", 0.6))
+                # Engine may be BLIP1Engine directly, or have ._blip1_engine sidecar
+                blip1_eng = getattr(self._engine, "_blip1_engine", None) or self._engine
+                self._reranker = BLIP1ITMReranker(engine=blip1_eng, alpha=alpha)
+                logger.info(
+                    "[NLVideoSearcher] Auto-attached BLIP1ITMReranker (alpha=%.2f)", alpha
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[NLVideoSearcher] Could not auto-attach BLIP1ITMReranker: %s", exc
+                )
+
+        elif use_filip:
+            try:
+                from .reranker_filip import FILIPReranker
+                alpha    = float(s.get("filip_alpha",    0.6))
+                n_frames = int(s.get("filip_n_frames",   5))
+                norm     = bool(s.get("filip_normalize", True))
+                self._reranker = FILIPReranker(
+                    engine=self._engine, alpha=alpha,
+                    n_frames=n_frames, normalize_filip=norm,
+                )
+                logger.info(
+                    "[NLVideoSearcher] Auto-attached FILIPReranker "
+                    "(alpha=%.2f n_frames=%d normalize=%s)",
+                    alpha, n_frames, norm,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[NLVideoSearcher] Could not auto-attach FILIPReranker: %s", exc
+                )
 
     @classmethod
     def from_config(cls, path: str):
@@ -377,8 +427,14 @@ class NLVideoSearcher:
                                 absolute_end=m.absolute_end)
                    for i, (sc, m) in enumerate(dedup)]
 
-        # Phase 3: two-stage retrieval via reranker (BLIP-2 or BLIP-1 ITM)
-        if use_reranker and self._reranker is not None:
+        # Phase 3: two-stage retrieval via reranker
+        # Auto-enable reranker if config attached one AND caller did not opt out
+        _has_config_reranker = (
+            self._reranker is not None and
+            (self._config.get("search", {}).get("use_itm_reranker") or
+             self._config.get("search", {}).get("use_filip_reranker"))
+        )
+        if (use_reranker or _has_config_reranker) and self._reranker is not None:
             reranked = self._reranker.rerank(results, cleaned, top_k=k)
             results = [
                 SearchResult(
@@ -398,19 +454,22 @@ class NLVideoSearcher:
 
     def set_reranker(self, reranker) -> None:
         """
-        Attach a BLIP-2 reranker to this searcher instance.
+        Manually attach a reranker to this searcher instance.
+
+        When use_itm_reranker or use_filip_reranker is set in the config YAML,
+        the reranker is auto-attached in __init__.  Use this method to override
+        or replace the auto-attached reranker at runtime.
 
         Parameters
         ----------
-        reranker : BLIP2Reranker | None
-            A ``BLIP2Reranker`` instance (from ``src.reranker``), or None to
-            disable reranking.  Passing a reranker does **not** load the model
-            immediately when ``lazy_load=True`` (default).
+        reranker : BLIP1ITMReranker | FILIPReranker | BLIP2Reranker | None
+            Any object with a `rerank(candidates, query, top_k)` method,
+            or None to disable reranking.
 
         Example
         -------
-            from src.reranker import BLIP2Reranker
-            searcher.set_reranker(BLIP2Reranker(device="cpu"))
+            from src.reranker import BLIP1ITMReranker
+            searcher.set_reranker(BLIP1ITMReranker(engine, alpha=0.6))
             results = searcher.search("person climbing fence", use_reranker=True)
         """
         self._reranker = reranker
