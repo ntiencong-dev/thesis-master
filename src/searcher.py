@@ -159,13 +159,13 @@ class NLVideoSearcher:
         Raises RuntimeError if Qdrant is unavailable (no Faiss fallback).
         Raises RuntimeError if the collection exists with the wrong embed_dim.
         """
-        url  = idx_cfg.get("qdrant_url",        "http://localhost:6333")
+        path = idx_cfg.get("qdrant_path",       "./local_qdrant_db")
         coll = idx_cfg.get("qdrant_collection", "nlvs_segments_blip1")
         dim  = idx_cfg.get("embed_dim",         self._engine.embed_dim)
         try:
             from qdrant_client import QdrantClient
             from qdrant_client.models import Distance, VectorParams
-            client = QdrantClient(url=url, timeout=10)
+            client = QdrantClient(path=path)
             existing = {c.name for c in client.get_collections().collections}
             if coll not in existing:
                 client.create_collection(

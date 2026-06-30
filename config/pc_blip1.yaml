@@ -30,7 +30,7 @@ pipeline:
 index:
   embed_dim: 256            # BLIP-1 ITC projection dim (ViT-B/16 → 768 → 256)
   backend: qdrant
-  qdrant_url: http://localhost:6333
+  qdrant_path: ./local_qdrant_db
   qdrant_collection: nlvs_segments_blip1   # separate from EVA-CLIP collection
 
 capture:

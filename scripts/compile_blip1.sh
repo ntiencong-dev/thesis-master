@@ -24,6 +24,12 @@ QUANT_DIR="${WORKSPACE}/quantized"
 OUTPUT_DIR="${WORKSPACE}/compiled"
 ARCH="/opt/vitis_ai/compiler/arch/DPUCZDX8G/KV260/arch.json"
 
+# ── Step 1: PTQ calibration + export → INT8 xmodel ──────────────────────────
+echo ""
+echo "[1/3] PTQ INT8: calibration + xmodel export ..."
+cd "${WORKSPACE}"
+python scripts/quantize_blip1.py --step all --output-dir "${QUANT_DIR}"
+
 # Input xmodel name produced by vai_q_pytorch (may vary by version)
 # Try common naming patterns
 QUANT_XMODEL=""
@@ -71,7 +77,6 @@ vai_c_xir \
     --arch       "${ARCH}" \
     --net_name   "blip1_vision" \
     --output_dir "${OUTPUT_DIR}" \
-    --options    '{"input_shape": "4,3,384,384"}' \
     2>&1 | tee "${OUTPUT_DIR}/compile_log.txt"
 
 # ------------------------------------------------------------------

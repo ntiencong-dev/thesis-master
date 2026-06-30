@@ -51,7 +51,7 @@ pipeline:
 index:
   embed_dim: 512             # CLIP ViT-B/16 embedding dimension
   backend: qdrant
-  qdrant_url: http://localhost:6333
+  qdrant_path: ./local_qdrant_db
   qdrant_collection: nlvs_segments   # CLIP collection (512d)
 
 capture:

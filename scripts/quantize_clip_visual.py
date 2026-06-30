@@ -112,13 +112,15 @@ class ManualMultiheadAttention(nn.Module):
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, key_padding_mask=None, need_weights=False, attn_mask=None) -> torch.Tensor:
         # Hardcode mọi thông số để XIR không thể hiểu nhầm
+        # Use static shapes for batch size 1 to satisfy vai_c_xir
         B, T, C = 1, 197, 768
         H, Hd   = 12, 64
+        k_len   = 197
 
-        q = self.q_proj(query) 
-        k = self.k_proj(key)   
-        v = self.v_proj(value) 
-
+        q = self.q_proj(query)  # (1, 197, 768)
+        k = self.k_proj(key)    # (1, 197, 768)
+        v = self.v_proj(value)  # (1, 197, 768)
+        
         # Dùng .view() và .transpose() thay cho reshape/permute, kèm theo .contiguous()
         q = q.view(1, 197, 12, 64).transpose(1, 2)  # (1, 12, 197, 64)
         k = k.view(1, 197, 12, 64).transpose(1, 2)
@@ -200,14 +202,14 @@ def _patch_visual_for_xir(wrapper: "CLIPVisualWrapper") -> None:
 
     def _bf_vit_forward(self, x: torch.Tensor) -> torch.Tensor:
         # ── Patch embedding ──
-        x = self.conv1(x)                                    
-        x = x.flatten(2).transpose(1, 2).contiguous() # (1, 196, 768)
+        x = self.conv1(x)                                    # (1, 768, 14, 14)
+        x = x.flatten(2).transpose(1, 2).contiguous()        # (1, 196, 768)
 
         # ── CLS token ──
         cls_token = self.class_embedding.view(1, 1, 768).to(x.dtype)
-        x = torch.cat([cls_token, x], dim=1)  # (1, 197, 768)               
+        x = torch.cat([cls_token, x], dim=1)                 # (1, 197, 768)
         
-        # ── Positional Embedding (SỬA LỖI BROADCAST Ở ĐÂY) ──
+        # ── Positional Embedding ──
         # Ép lên (1, 197, 768) để cấm PyTorch/XIR tự động đoán chiều
         pos_emb = self.positional_embedding.unsqueeze(0).to(x.dtype)
         x = x + pos_emb

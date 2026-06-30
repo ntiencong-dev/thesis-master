@@ -37,7 +37,7 @@ pipeline:
 index:
   embed_dim: 256
   backend: qdrant
-  qdrant_url: http://localhost:6333
+  qdrant_path: ./local_qdrant_db
   qdrant_collection: nlvs_segments_kria_blip1  # Kria-specific collection (256-dim)
 
 capture:

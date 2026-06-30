@@ -37,7 +37,7 @@ log = logging.getLogger(__name__)
 MODEL_NAME  = "Salesforce/blip-itm-base-coco"
 CALIB_NPY   = Path("exported_models/calibration_frames_blip1.npy")
 OUTPUT_DIR  = Path("quantized")
-BATCH_SIZE  = 16
+BATCH_SIZE  = 1
 INPUT_SHAPE = (1, 3, 384, 384)
 
 
@@ -64,6 +64,58 @@ def _load_wrapper() -> BlipVisualITCWrapper:
     log.info("Loading BLIP-1 from HuggingFace cache ...")
     blip = BlipForImageTextRetrieval.from_pretrained(MODEL_NAME)
     blip.eval().cpu()
+
+    # Apply strict static shapes for DPU compilation (BATCH_SIZE = 1)
+    import types
+    from typing import Optional, Tuple
+    import torch.nn.functional as F
+
+    def _bf_blip_embeddings_forward(self, pixel_values: torch.FloatTensor, **kwargs) -> torch.Tensor:
+        target_dtype = self.patch_embedding.weight.dtype
+        patch_embeds = self.patch_embedding(pixel_values)
+        patch_embeds = patch_embeds.flatten(2).transpose(1, 2).contiguous()
+
+        class_embeds = self.class_embedding.view(1, 1, -1).to(target_dtype)
+        embeddings = torch.cat([class_embeds, patch_embeds], dim=1)
+        
+        pos_emb = self.position_embedding[:, : embeddings.size(1), :].to(target_dtype)
+        embeddings = embeddings + pos_emb
+        return embeddings
+
+    blip.vision_model.embeddings.forward = types.MethodType(_bf_blip_embeddings_forward, blip.vision_model.embeddings)
+
+    def _bf_blip_attn_forward(
+        self,
+        hidden_states: torch.Tensor,
+        head_mask: Optional[torch.Tensor] = None,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        tgt_len = hidden_states.size(1)
+        embed_dim = self.embed_dim
+
+        mixed_qkv = self.qkv(hidden_states)
+        mixed_qkv = mixed_qkv.view(1, tgt_len, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4).contiguous()
+        
+        query_states, key_states, value_states = mixed_qkv[0], mixed_qkv[1], mixed_qkv[2]
+
+        attention_scores = torch.matmul(query_states, key_states.transpose(2, 3))
+        attention_scores = attention_scores * self.scale
+        attention_probs = F.softmax(attention_scores, dim=-1)
+        attention_probs = self.dropout(attention_probs)
+
+        if head_mask is not None:
+            attention_probs = attention_probs * head_mask
+
+        context_layer = torch.matmul(attention_probs, value_states).permute(0, 2, 1, 3).contiguous()
+        context_layer = context_layer.view(1, tgt_len, embed_dim)
+
+        output = self.projection(context_layer)
+        return (output, attention_probs) if output_attentions else (output, None)
+
+    for layer in blip.vision_model.encoder.layers:
+        layer.self_attn.forward = types.MethodType(_bf_blip_attn_forward, layer.self_attn)
+        
+    log.info("[XIR patch] BLIP-1 embeddings and attention blocks patched for static shape (B=1, contiguous memory).")
     wrapper = BlipVisualITCWrapper(blip)
     wrapper.eval()
     log.info("Wrapper loaded. Params: %d M",
@@ -142,7 +194,11 @@ def run_export(output_dir: Path) -> None:
         fp32_ref = np.load(str(ref_npy))
         pv_batch = torch.from_numpy(np.load(str(ref_pv)))
         with torch.no_grad():
-            int8_out = quant_model(pv_batch).numpy()
+            int8_outs = []
+            for i in range(pv_batch.shape[0]):
+                single_input = pv_batch[i:i+1]
+                int8_outs.append(quant_model(single_input))
+            int8_out = torch.cat(int8_outs, dim=0).numpy()
         cos_sims = (fp32_ref * int8_out).sum(axis=1)
         mean_sim = float(cos_sims.mean())
         min_sim  = float(cos_sims.min())

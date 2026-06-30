@@ -140,13 +140,13 @@ class ContinuousIndexer:
         """
         idx_cfg         = self._config.get("index", {})
         embed_dim       = idx_cfg.get("embed_dim", 256)
-        qdrant_url      = idx_cfg.get("qdrant_url",        "http://localhost:6333")
+        qdrant_path     = idx_cfg.get("qdrant_path",       "./local_qdrant_db")
         collection_name = idx_cfg.get("qdrant_collection", "nlvs_segments_blip1")
         try:
             from qdrant_client import QdrantClient
             from qdrant_client.models import Distance, VectorParams
 
-            client = QdrantClient(url=qdrant_url, timeout=10)
+            client = QdrantClient(path=qdrant_path)
             existing = {c.name for c in client.get_collections().collections}
             if collection_name not in existing:
                 client.create_collection(
@@ -159,11 +159,11 @@ class ContinuousIndexer:
 
             self._qdrant_client     = client
             self._qdrant_collection = collection_name
-            logger.info("[ContinuousIndexer] Qdrant backend ready at %s.", qdrant_url)
+            logger.info("[ContinuousIndexer] Qdrant backend ready at %s.", qdrant_path)
         except Exception as exc:
             raise RuntimeError(
-                f"[ContinuousIndexer] Qdrant unavailable at {qdrant_url}: {exc}. "
-                "Start Qdrant before launching ContinuousIndexer."
+                f"[ContinuousIndexer] Qdrant unavailable at {qdrant_path}: {exc}. "
+                "Check folder permissions."
             ) from exc
 
     # ------------------------------------------------------------------
