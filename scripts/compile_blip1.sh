@@ -34,6 +34,8 @@ python scripts/quantize_blip1.py --step all --output-dir "${QUANT_DIR}"
 # Try common naming patterns
 QUANT_XMODEL=""
 for candidate in \
+    "${QUANT_DIR}/BlipVisionModel_int.xmodel" \
+    "${QUANT_DIR}/quantize_result/BlipVisionModel.xmodel" \
     "${QUANT_DIR}/blip1_visual_fp32_int.xmodel" \
     "${QUANT_DIR}/BlipVisualITCWrapper_int.xmodel" \
     "${QUANT_DIR}/quantize_result/BlipVisualITCWrapper.xmodel"; do

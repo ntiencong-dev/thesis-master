@@ -32,6 +32,7 @@ factory can gracefully reject kria config on non-Kria hardware.
 
 from __future__ import annotations
 
+import os
 from typing import List, Union
 
 import numpy as np
@@ -112,6 +113,13 @@ class MacroRunnerPool:
 
         scale = output_tensors[0].get_attr("fix_point")
         feats = outputs[0][:n].astype(np.float32) * (2.0 ** (-scale))
+        
+        # If the output is 3D (B, 577, 768), this is the BLIP-1 model outputting patches.
+        # We DO NOT L2 normalize here. We return the raw patches.
+        if feats.ndim == 3:
+            return feats
+            
+        # For CLIP (B, 1024 or 512), apply L2 normalization
         norms = np.linalg.norm(feats, axis=1, keepdims=True).clip(1e-8)
         return (feats / norms).astype(np.float32)
 
@@ -178,6 +186,15 @@ class KriaEngine(InferenceEngine):
         self._awq_text_path = engine_cfg.get("awq_text_path")
         self._awq_bert_path = engine_cfg.get("awq_bert_path")
 
+        # Load vision_proj if we are running Hướng 2 (BLIP-1 Retrieval)
+        self._vision_proj = None
+        proj_path = "exported_models/blip1_vision_proj.pt"
+        if os.path.exists(proj_path):
+            import torch
+            self._vision_proj = torch.nn.Linear(768, 256)
+            self._vision_proj.load_state_dict(torch.load(proj_path, map_location="cpu"))
+            self._vision_proj.eval()
+
         if engine_cfg.get("xmodel_text_path") and not self._awq_text_path:
             self._text_runner = self._load_runner(
                 engine_cfg["xmodel_text_path"], device_id=device_id
@@ -219,11 +236,28 @@ class KriaEngine(InferenceEngine):
             job_id = self._vision_runner.execute_async(inputs, outputs)
             self._vision_runner.wait(job_id)
 
-            # Dequantise INT8 → float32, then L2-normalise
+            # Dequantise INT8 → float32
             scale  = output_tensors[0].get_attr("fix_point")
             feats  = outputs[0][:len(batch)].astype(np.float32) * (2.0 ** (-scale))
-            norms  = np.linalg.norm(feats, axis=1, keepdims=True).clip(1e-8)
-            results.append((feats / norms).astype(np.float32))
+            
+            if feats.ndim == 3:
+                # BLIP-1 (Hướng 2 Retrieval): feats is (B, 577, 768)
+                # Apply vision_proj to get (B, 256) summary vector on ARM CPU!
+                if self._vision_proj is None:
+                    raise RuntimeError("blip1_vision_proj.pt is missing! Cannot run BLIP-1 Retrieval.")
+                import torch
+                with torch.no_grad():
+                    # Extract [CLS] token at index 0
+                    cls_feat = torch.from_numpy(feats[:, 0, :])
+                    embed    = self._vision_proj(cls_feat)
+                    norm     = embed.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+                    feats    = (embed / norm).numpy()
+            else:
+                # CLIP (Hướng 1 Retrieval): feats is (B, 1024 or 512)
+                norms  = np.linalg.norm(feats, axis=1, keepdims=True).clip(1e-8)
+                feats  = (feats / norms).astype(np.float32)
+                
+            results.append(feats)
 
         return np.vstack(results)
 
@@ -242,9 +276,86 @@ class KriaEngine(InferenceEngine):
             batch = frames_bgr[i : i + self._batch_size]
             # BLIP-1 input: 384×384 (khác CLIP 224×224)
             preprocessed = self._preprocess_frames(batch, size=384)
+            # Returns raw (B, 577, 768) patches from DPU
             feats = self._macro_pool.run_vision(MacroRunnerPool.BLIP1, preprocessed)
             results.append(feats)
         return np.vstack(results)
+        
+    def score_itm(self, frames_bgr: List[np.ndarray], text: str) -> np.ndarray:
+        """
+        Stage 2 Reranking: ITM Cross-Attention on ARM CPU.
+        Takes the (1, 577, 768) raw patches from DPU, and passes them to AWQ BERT.
+        """
+        import torch
+        import torch.nn.functional as F
+
+        if not frames_bgr:
+            return np.zeros(0, dtype=np.float32)
+
+        if not self._awq_bert_path:
+            raise RuntimeError("score_itm requires awq_bert_path to be set in config!")
+
+        # Lazy-load AWQ BERT text encoder on CPU
+        if not hasattr(self, "_awq_bert_model"):
+            from transformers import BertConfig
+            from .quantized_linear import replace_with_quantized_linear
+            from transformers.models.blip.modeling_blip import BlipTextModel
+
+            awq_data = torch.load(
+                f"{self._awq_bert_path}/blip1_bert_awq.pt", map_location="cpu"
+            )
+            config = BertConfig.from_dict(awq_data["config"])
+            model = BlipTextModel(config, add_pooling_layer=False)
+            replace_with_quantized_linear(model, awq_data["state_dict"])
+            model.load_state_dict(awq_data["state_dict"], strict=False)
+            model.eval()
+            self._awq_bert_model = model
+            
+            import open_clip # open_clip tokenizer is not for bert, use transformers
+            from transformers import BertTokenizer
+            self._awq_bert_tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+            
+            # Extract ITM head
+            self._itm_head = torch.nn.Linear(config.hidden_size, 2)
+            self._itm_head.load_state_dict(awq_data["itm_head"])
+            self._itm_head.eval()
+
+        # 1. Get raw patches from DPU!
+        image_feats_np = self.encode_frames_blip1(frames_bgr) # (B, 577, 768)
+        B = image_feats_np.shape[0]
+        image_feats = torch.from_numpy(image_feats_np).to(torch.float32)
+
+        # 2. Tokenize text (Query repeated B times)
+        txt_inputs = self._awq_bert_tokenizer(
+            text=[text] * B,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        input_ids = txt_inputs.input_ids
+        attention_mask = txt_inputs.attention_mask
+
+        # 3. ITM Cross-Attention on ARM CPU
+        with torch.no_grad():
+            img_att = torch.ones(image_feats.shape[:2], dtype=torch.long)
+            
+            text_out = self._awq_bert_model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                encoder_hidden_states=image_feats,
+                encoder_attention_mask=img_att,
+                return_dict=True,
+            )
+            
+            # Get [CLS] token from BERT output
+            cls_out = text_out.last_hidden_state[:, 0, :]
+            itm_logits = self._itm_head(cls_out)
+            
+            # Probability of "Match" (index 1)
+            probs = F.softmax(itm_logits, dim=1)[:, 1]
+
+        return probs.numpy()
 
     def encode_text(self, texts: Union[str, List[str]]) -> np.ndarray:
         """

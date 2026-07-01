@@ -84,11 +84,28 @@ def main():
     print(f"      Total Time : {total_time:.2f} s")
     print(f"      Latency    : {ms_per_query:.2f} ms / query")
 
-    print("\n[!] STAGE-2 RERANKING GAP DETECTED:")
-    print("      The BLIP-1 ITM Stage-2 Reranker cannot be benchmarked on Kria yet.")
-    print("      Reason: The compiled DPU model `blip1_vision.xmodel` outputs a pooled (1, 256) vector.")
-    print("      However, ITM cross-attention requires the raw (1, 577, 768) spatial patch features from the ViT.")
-    print("      This architectural gap prevents `score_itm` from running on the edge!")
+    # 4. Benchmark Stage-2 Reranker (ITM Cross-Attention on ARM CPU)
+    if hasattr(engine, "score_itm"):
+        print(f"\n[4/4] Benchmarking Stage-2 ITM Reranker (ARM Cortex-A53 AWQ)...")
+        # We need to simulate the pipeline: extracting 5 uniform frames from a segment
+        itm_frames = generate_mock_frames(5, h=384, w=384)
+        
+        # Warmup
+        _ = engine.score_itm(itm_frames, MOCK_QUERIES[0])
+        
+        # Benchmark
+        t0 = time.time()
+        for query in MOCK_QUERIES:
+            _ = engine.score_itm(itm_frames, query)
+        t1 = time.time()
+        
+        total_time = t1 - t0
+        ms_per_itm = (total_time / len(MOCK_QUERIES)) * 1000
+        
+        print(f"      Total Time : {total_time:.2f} s")
+        print(f"      Latency    : {ms_per_itm:.2f} ms / segment-query pair")
+    else:
+        print("\n[!] Stage-2 ITM Benchmarking skipped (Not a BLIP-1 or Hybrid engine).")
     
     print(f"\n==================================================")
     print(f"  Benchmark Complete.")
