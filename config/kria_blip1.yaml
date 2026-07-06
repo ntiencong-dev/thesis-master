@@ -23,7 +23,8 @@ engine:
   type: kria                # KriaEngine → DPU B4096 via VART/XIR
   # BLIP-1 ViT-B/16 xmodel paths (to be compiled with Vitis AI 3.5)
   xmodel_path:      /usr/share/vitis_ai_library/models/blip1_vit_b16/blip1_vision.xmodel
-  xmodel_text_path: /usr/share/vitis_ai_library/models/blip1_vit_b16/blip1_text.xmodel
+  # xmodel_text_path is removed because text runs on CPU
+  awq_bert_path:    exported_models/blip1_bert_awq_int4
   embed_dim: 256            # BLIP-1 ITC projection dim
   batch_size: 4             # DPU B4096 optimal batch
   frames_per_window: 5

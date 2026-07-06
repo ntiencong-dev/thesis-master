@@ -1,6 +1,9 @@
-# Core ML
-torch>=2.0.0
-torchvision>=0.15.0
+# Core ML (Use the pre-installed system PyTorch on KV260!)
+# torch>=2.0.0
+# torchvision>=0.15.0
+
+numpy
+pyyaml
 
 # Vision-Language Model
 transformers>=4.35.0
@@ -25,7 +28,6 @@ pydantic>=2.0.0
 pyyaml>=6.0.0
 
 # Utilities
-numpy>=1.24.0
 Pillow>=10.0.0
 tqdm>=4.65.0
 

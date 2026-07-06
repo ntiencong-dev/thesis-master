@@ -249,7 +249,7 @@ def _load_wrapper() -> CLIPVisualWrapper:
 
     log.info("Loading CLIP %s (%s) ...", MODEL_NAME, PRETRAINED)
     model, _, _ = open_clip.create_model_and_transforms(
-        MODEL_NAME, pretrained=PRETRAINED
+        MODEL_NAME, pretrained=PRETRAINED, cache_dir="./model_cache"
     )
     model.eval().cpu()
     wrapper = CLIPVisualWrapper(model)
@@ -398,7 +398,7 @@ def build_fp32_reference(output_dir: Path, n_ref: int = 16) -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
     model, preprocess, _ = open_clip.create_model_and_transforms(
-        MODEL_NAME, pretrained=PRETRAINED
+        MODEL_NAME, pretrained=PRETRAINED, cache_dir="./model_cache"
     )
     model.eval()
 

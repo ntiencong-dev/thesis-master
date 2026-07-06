@@ -1,0 +1,6 @@
+{
+    "calib_statistic_method": "percentile",
+    "percentile": 99.99,
+    "include_cle": true,
+    "keep_first_last_layer_accuracy": true
+}

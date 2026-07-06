@@ -192,8 +192,11 @@ class KriaEngine(InferenceEngine):
         if os.path.exists(proj_path):
             import torch
             self._vision_proj = torch.nn.Linear(768, 256)
-            self._vision_proj.load_state_dict(torch.load(proj_path, map_location="cpu"))
+            self._vision_proj.load_state_dict(torch.load(proj_path, map_location="cpu", weights_only=False))
             self._vision_proj.eval()
+        else:
+            if engine_cfg.get("awq_bert_path"):
+                raise RuntimeError(f"Missing {proj_path}. Please run python3 scripts/download_hf_weights.py on the board.")
 
         if engine_cfg.get("xmodel_text_path") and not self._awq_text_path:
             self._text_runner = self._load_runner(
@@ -216,11 +219,14 @@ class KriaEngine(InferenceEngine):
         Nếu MACRO mode đang bật, dùng MacroRunnerPool (không reload weights).
         """
         results: List[np.ndarray] = []
+        is_blip1 = getattr(self, "_vision_proj", None) is not None
+        target_size = 384 if is_blip1 else 224
+
         for i in range(0, len(frames_bgr), self._batch_size):
             batch = frames_bgr[i : i + self._batch_size]
-            preprocessed = self._preprocess_frames(batch)
+            preprocessed = self._preprocess_frames(batch, size=target_size)
 
-            if self._macro_pool is not None:
+            if getattr(self, "_macro_pool", None) is not None:
                 # MACRO path: runner luôn sẵn sàng trong DDR
                 feats = self._macro_pool.run_vision(MacroRunnerPool.CLIP, preprocessed)
                 results.append(feats)
@@ -232,7 +238,37 @@ class KriaEngine(InferenceEngine):
             inputs  = [np.empty(t.dims, dtype=np.int8) for t in input_tensors]
             outputs = [np.empty(t.dims, dtype=np.int8) for t in output_tensors]
 
-            inputs[0][:len(batch)] = preprocessed
+            # DPU expects (B, 577, 768) -> PatchEmbed was assigned to CPU by compiler!
+            if input_tensors[0].dims[1:] == [577, 768]:
+                if not hasattr(self, "_patch_embedder"):
+                    import torch
+                    from transformers.models.blip.modeling_blip import BlipVisionEmbeddings
+                    from transformers import BlipConfig
+                    
+                    embed_path = "exported_models/blip1_patch_embed.pt"
+                    if not os.path.exists(embed_path):
+                        raise RuntimeError(f"Missing {embed_path}. Please run python3 scripts/download_hf_weights.py on the board.")
+                        
+                    config = BlipConfig.from_pretrained("Salesforce/blip-itm-base-coco").vision_config
+                    self._patch_embedder = BlipVisionEmbeddings(config)
+                    self._patch_embedder.load_state_dict(torch.load(embed_path, map_location="cpu", weights_only=False))
+                    self._patch_embedder.eval()
+                
+                import torch
+                with torch.no_grad():
+                    # (B, H, W, C) -> (B, C, H, W)
+                    pixel_values = torch.from_numpy(preprocessed).permute(0, 3, 1, 2).float()
+                    # Forward pass through CPU patch embedder
+                    patch_embeds = self._patch_embedder(pixel_values).numpy()
+                
+                # Quantize CPU FP32 to DPU INT8
+                scale = input_tensors[0].get_attr("fix_point")
+                patch_embeds_int8 = np.clip(np.round(patch_embeds * (2.0 ** scale)), -128, 127).astype(np.int8)
+                inputs[0][:len(batch)] = patch_embeds_int8
+            else:
+                # DPU takes raw images directly
+                inputs[0][:len(batch)] = preprocessed
+
             job_id = self._vision_runner.execute_async(inputs, outputs)
             self._vision_runner.wait(job_id)
 
@@ -302,7 +338,7 @@ class KriaEngine(InferenceEngine):
             from transformers.models.blip.modeling_blip import BlipTextModel
 
             awq_data = torch.load(
-                f"{self._awq_bert_path}/blip1_bert_awq.pt", map_location="cpu"
+                f"{self._awq_bert_path}/blip1_bert_awq.pt", map_location="cpu", weights_only=False
             )
             config = BertConfig.from_dict(awq_data["config"])
             model = BlipTextModel(config, add_pooling_layer=False)
@@ -362,12 +398,16 @@ class KriaEngine(InferenceEngine):
         Encode text queries.
 
         Ưu tiên:
-        1. AWQ INT4 text encoder (ARM CPU) nếu awq_text_path được set — tiết kiệm bộ nhớ
-        2. DPU text runner (xmodel_text_path) nếu có
-        3. Fallback: open_clip FP32 trên ARM CPU
+        1. AWQ BLIP-1 text encoder (ARM CPU) nếu awq_bert_path được set (Cho Hướng 2).
+        2. AWQ INT4 CLIP text encoder (ARM CPU) nếu awq_text_path được set.
+        3. DPU text runner (xmodel_text_path) nếu có.
+        4. Fallback: open_clip FP32 trên ARM CPU (Chỉ đúng cho Hướng 1).
         """
         if isinstance(texts, str):
             texts = [texts]
+
+        if self._awq_bert_path:
+            return self._encode_text_blip1_awq(texts)
 
         if self._awq_text_path:
             return self._encode_text_awq(texts)
@@ -375,8 +415,59 @@ class KriaEngine(InferenceEngine):
         if self._text_runner is not None:
             return self._encode_text_dpu(texts)
 
-        # Fallback: open_clip FP32 trên ARM CPU
+        # Fallback: open_clip FP32 trên ARM CPU (Chỉ dùng cho CLIP)
         return self._encode_text_fp32_fallback(texts)
+
+    def _encode_text_blip1_awq(self, texts: List[str]) -> np.ndarray:
+        """Sử dụng AWQ BERT model trên ARM CPU để encode text query thành 256-D (BLIP-1)."""
+        import torch, torch.nn.functional as F
+        
+        # 1. Đảm bảo model BERT đã được load (giống hệt logic của score_itm)
+        if not hasattr(self, "_awq_bert_model"):
+            from transformers import BertConfig
+            from .quantized_linear import replace_with_quantized_linear
+            from transformers.models.blip.modeling_blip import BlipTextModel
+            import json
+
+            config = BertConfig.from_pretrained("Salesforce/blip-itm-base-coco")
+            config.is_decoder = True
+            config.add_cross_attention = True
+            model = BlipTextModel(config)
+
+            awq_ckpt = torch.load(f"{self._awq_bert_path}/blip1_text_awq.pt", map_location="cpu", weights_only=False)
+            replace_with_quantized_linear(model, awq_ckpt["model_state_dict"])
+            model.load_state_dict(awq_ckpt["model_state_dict"])
+            model.eval()
+            self._awq_bert_model = model
+
+            from transformers import AutoTokenizer
+            self._awq_bert_tokenizer = AutoTokenizer.from_pretrained(self._awq_bert_path)
+            
+        # 2. Đảm bảo text projection layer (768 -> 256) được load
+        if getattr(self, "_blip1_text_proj", None) is None:
+            proj_path = "exported_models/blip1_text_proj.pt"
+            if os.path.exists(proj_path):
+                self._blip1_text_proj = torch.nn.Linear(768, 256)
+                self._blip1_text_proj.load_state_dict(torch.load(proj_path, map_location="cpu", weights_only=False))
+                self._blip1_text_proj.eval()
+            else:
+                raise RuntimeError(f"Missing {proj_path}. Please run python3 scripts/download_hf_weights.py on the board.")
+
+        # 3. Chạy tokenizer và encode
+        inputs = self._awq_bert_tokenizer(
+            texts, padding=True, truncation=True, max_length=512, return_tensors="pt"
+        )
+        with torch.no_grad():
+            out = self._awq_bert_model(
+                input_ids=inputs.input_ids,
+                attention_mask=inputs.attention_mask,
+                return_dict=True
+            )
+            cls_feat = out.last_hidden_state[:, 0, :]  # (B, 768)
+            embed = self._blip1_text_proj(cls_feat)    # (B, 256)
+            embed = F.normalize(embed, dim=-1)
+            
+        return embed.numpy()
 
     def _encode_text_awq(self, texts: List[str]) -> np.ndarray:
         """Load và chạy AWQ INT4 CLIP text encoder."""
@@ -390,7 +481,7 @@ class KriaEngine(InferenceEngine):
         # Lazy-load AWQ model (lần đầu tiên gọi)
         if not hasattr(self, "_awq_clip_model"):
             awq_data = torch.load(
-                f"{self._awq_text_path}/clip_text_awq.pt", map_location="cpu"
+                f"{self._awq_text_path}/clip_text_awq.pt", map_location="cpu", weights_only=False
             )
             model, _, _ = open_clip.create_model_and_transforms(
                 awq_data.get("model_name", "ViT-B-16"),

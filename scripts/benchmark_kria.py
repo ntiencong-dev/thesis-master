@@ -2,7 +2,11 @@ import argparse
 import time
 import numpy as np
 import yaml
+import sys
 from pathlib import Path
+
+# Add project root to Python path so it can find the 'src' module
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Provide a mock dataset for benchmarking
 MOCK_QUERIES = [
